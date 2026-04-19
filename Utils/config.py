@@ -115,7 +115,10 @@ class TrainConfig:
     cv_folds: int = 0
     use_weighted_sampler: bool = False
     calibrate_temperature: bool = True
-    threshold_selection: str = "youden"  # "youden", "f1", or "fixed"
+    threshold_selection: str = "youden"  # "youden", "f1", "fbeta", or "fixed"
+    threshold_fbeta: float = 1.0  # used when threshold_selection == "fbeta"; >1 favors recall
+    calibration_method: str = "temperature"  # "temperature", "isotonic", or "temperature+isotonic"
+    tta_enabled: bool = False  # flip-based test-time augmentation during collect_predictions
 
 
 @dataclass(slots=True)

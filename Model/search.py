@@ -208,6 +208,14 @@ def _sample_trial_configs(
         if loss_type == "focal"
         else base_train.focal_gamma
     )
+    threshold_selection = trial.suggest_categorical(
+        "threshold_selection", ["youden", "f1", "fbeta"],
+    )
+    threshold_fbeta = (
+        trial.suggest_float("threshold_fbeta", 1.0, 2.0)
+        if threshold_selection == "fbeta"
+        else base_train.threshold_fbeta
+    )
     train_config = replace(
         base_train,
         output_dir=output_dir / f"trial_{trial.number:03d}",
@@ -232,7 +240,12 @@ def _sample_trial_configs(
         gradient_clip_norm=trial.suggest_categorical("gradient_clip_norm", [0.25, 0.5, 1.0, 2.0]),
         use_weighted_sampler=trial.suggest_categorical("use_weighted_sampler", [False, True]),
         amp=trial.suggest_categorical("amp", [True, False]),
-        threshold_selection=trial.suggest_categorical("threshold_selection", ["youden", "f1"]),
+        threshold_selection=threshold_selection,
+        threshold_fbeta=threshold_fbeta,
+        calibration_method=trial.suggest_categorical(
+            "calibration_method", ["temperature", "isotonic", "temperature+isotonic"],
+        ),
+        tta_enabled=trial.suggest_categorical("tta_enabled", [False, True]),
     )
     return data_config, aug_config, model_config, train_config
 
@@ -309,6 +322,9 @@ def _configs_from_params(
         use_weighted_sampler=params.get("use_weighted_sampler", base_train.use_weighted_sampler),
         amp=params.get("amp", base_train.amp),
         threshold_selection=params.get("threshold_selection", base_train.threshold_selection),
+        threshold_fbeta=params.get("threshold_fbeta", base_train.threshold_fbeta),
+        calibration_method=params.get("calibration_method", base_train.calibration_method),
+        tta_enabled=params.get("tta_enabled", base_train.tta_enabled),
     )
     return data_config, aug_config, model_config, train_config
 

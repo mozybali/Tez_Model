@@ -17,12 +17,14 @@ TezModel/
 │   └── transforms.py         # 3B flip, affine ve morfolojik augmentasyonlar
 ├── Model/
 │   ├── resnet3d.py           # PyTorch ile ResNet3D-18 / ResNet3D-34
-│   ├── engine.py             # Eğitim, doğrulama, test ve checkpoint akışı
+│   ├── engine.py             # Eğitim, doğrulama, test, kalibrasyon ve TTA akışı
 │   ├── train.py              # Tek eğitim çalıştırması için CLI
-│   └── search.py             # Optuna ile hiperparametre araması
+│   ├── search.py             # Optuna ile hiperparametre araması
+│   └── ensemble.py           # En iyi K Optuna trial'ı üzerinde soft-voting ensemble
 ├── Utils/
 │   ├── config.py             # Data, augmentasyon, model, eğitim ve arama ayarları
-│   ├── metrics.py            # ROC-AUC, PR-AUC, F1, balanced accuracy vb.
+│   ├── metrics.py            # ROC-AUC, PR-AUC, F1, F-beta, balanced accuracy vb.
+│   ├── calibration.py        # Temperature / isotonic kalibrasyon ve bootstrap eşik seçimi
 │   ├── plot_metrics.py       # Metrik görselleştirme yardımcıları
 │   └── reproducibility.py    # Rastgelelik kontrolü
 ├── Tests/
@@ -91,8 +93,12 @@ python -m Model.train \
   --target-shape 64 64 64 \
   --bbox-margin 8 \
   --decision-threshold 0.5 \
+  --threshold-selection youden \
+  --calibration-method temperature \
   --output-dir outputs/baseline
 ```
+
+Recall'u öne çıkarmak isterseniz `--threshold-selection fbeta --threshold-fbeta 1.5`, kalibrasyonun yetersiz kaldığı durumlarda `--calibration-method temperature+isotonic`, değerlendirmede flip tabanlı test-time augmentation için `--tta` kullanılabilir.
 
 Eğitim tamamlandığında model ve metrikler `outputs/baseline/` altına yazılır.
 
@@ -143,7 +149,9 @@ Bu özellikler yalnızca train split üzerinden hesaplanan istatistiklerle norma
 - sınıf dengesizliği için `BCEWithLogitsLoss` içinde pozitif sınıf ağırlığı kullanır,
 - seçilen optimizer ve scheduler ile eğitir,
 - doğrulama skoruna göre en iyi checkpoint'i kaydeder,
-- en iyi checkpoint ile test setini değerlendirir.
+- validasyon üzerinde post-hoc olasılık kalibrasyonu (temperature ve/veya isotonic) uygular,
+- bootstrap-ortalamalı karar eşiğini (Youden / F1 / F-beta) validasyondan seçer,
+- isteğe bağlı flip tabanlı test-time augmentation ile en iyi checkpoint üzerinde test setini değerlendirir.
 
 Cihaz seçimi `--device auto` ile otomatik yapılır. Uygunsa CUDA, ardından Apple MPS, aksi halde CPU kullanılır.
 
@@ -158,7 +166,12 @@ Başlıca eğitim parametreleri:
 | `--scheduler` | `cosine` | `cosine` veya `none` |
 | `--patience` | `6` | Erken durdurma sabrı |
 | `--gradient-clip-norm` | `1.0` | Gradient clipping sınırı |
-| `--decision-threshold` | `0.5` | Olasılıktan sınıfa geçiş eşiği |
+| `--decision-threshold` | `0.5` | `fixed` modunda kullanılan sabit eşik |
+| `--threshold-selection` | `youden` | `youden`, `f1`, `fbeta` veya `fixed` |
+| `--threshold-fbeta` | `1.0` | `fbeta` modunda beta; >1 recall'u öne çıkarır |
+| `--calibration-method` | `temperature` | `temperature`, `isotonic` veya `temperature+isotonic` |
+| `--tta` | kapalı | Değerlendirmede flip tabanlı test-time augmentation |
+| `--disable-calibration` | kapalı | Tüm post-hoc kalibrasyonu devre dışı bırakır |
 
 Eğitim çıktıları:
 
@@ -168,6 +181,7 @@ Eğitim çıktıları:
 | `history.json` | Epoch bazlı train ve validation metrikleri |
 | `best_val_metrics.json` | En iyi validation epoch metrikleri |
 | `test_metrics.json` | En iyi checkpoint ile test metrikleri |
+| `calibration.json` | Temperature / isotonic kalibrasyon, reliability bin'leri, seçilen eşik ve kalibre probabiliteler |
 | `best_model.pt` | En iyi model checkpoint'i |
 
 ## Augmentasyonlar
@@ -197,7 +211,7 @@ python -m Model.search \
 
 `--epochs`, her trial için maksimum epoch bütçesidir; arama sırasında bu bütçenin daha kısa alt değerleri de denenebilir. `--final-epochs` verilirse en iyi trial parametreleriyle `best_run/` altında bu epoch sayısıyla yeniden eğitim yapılır. Verilmezse en iyi trial'ın epoch bütçesi kullanılır.
 
-Arama uzayı learning rate, weight decay, optimizer, scheduler, batch size, epoch bütçesi, early stopping patience, gradient clipping, karar eşiği, ResNet derinliği, kanal sayısı, dropout, tabular özellik kullanımı, hedef hacim boyutu, bounding box crop, cube padding, sağ böbrek kanonikleştirme, NaN stratejisi ve augmentasyon parametrelerini kapsar.
+Arama uzayı learning rate, weight decay, optimizer, scheduler, batch size, epoch bütçesi, early stopping patience, gradient clipping, eşik seçimi stratejisi (`youden` / `f1` / `fbeta`) ve F-beta değeri, kalibrasyon yöntemi (`temperature` / `isotonic` / `temperature+isotonic`), flip tabanlı TTA, AMP, weighted sampler, ResNet derinliği, kanal sayısı, dropout, tabular özellik kullanımı, hedef hacim boyutu, bounding box crop, cube padding, sağ böbrek kanonikleştirme, NaN stratejisi ve augmentasyon parametrelerini kapsar.
 
 Optuna çıktıları:
 
@@ -209,6 +223,29 @@ Optuna çıktıları:
 | `best_run/` | En iyi parametrelerle yeniden eğitim |
 | `best_model.pt` | En iyi modelin kök arama klasöründeki kopyası |
 | `study_summary.json` | Genel arama özeti |
+
+## Ensemble
+
+Arama tamamlandıktan sonra en iyi K trial'ın checkpoint'leri soft-voting ile birleştirilebilir:
+
+```bash
+python -m Model.ensemble \
+  --study-dir outputs/optuna \
+  --top-k 5
+```
+
+`Model.ensemble`, `leaderboard.json` üzerinden en iyi K trial'ı seçer, her trial'ın `best_model.pt` ve `checkpoint_meta.json` dosyalarından konfigürasyonu yeniden kurar, test splitinde kalibre probabiliteleri ortalar ve bootstrap güven aralıklarıyla birlikte ensemble metriklerini raporlar.
+
+## Kalibrasyon ve Eşik Seçimi
+
+`Utils/calibration.py` şu araçları sağlar:
+
+- `fit_temperature` / `apply_temperature`: validasyon logitleri üzerinde tek skalerli temperature scaling.
+- `fit_isotonic` / `apply_isotonic`: temperature sonrası olasılıklar üzerinde monoton parçalı-lineer isotonic regresyon (yoğunluk dağılımı bimodal veya çarpık olduğunda faydalıdır).
+- `reliability_bins` ve `expected_calibration_error`: reliability diyagramı ve ECE hesabı.
+- `select_threshold_bootstrap`: bootstrap-ortalamalı Youden, F1 veya F-beta ile eşik seçimi — tek splitten kaynaklanan varyansı azaltır.
+
+Seçilen yöntem ve sonuçlar her çalıştırmanın `calibration.json` dosyasına yazılır; test metrikleri kalibre edilmiş probabilitelerle ve seçilen eşikle raporlanır.
 
 ## Testler
 
@@ -235,9 +272,10 @@ Eğitim ve değerlendirme sırasında aşağıdaki metrikler hesaplanır:
 - balanced accuracy
 - precision
 - recall
-- F1
+- F1 ve F-beta (eşik seçimi için)
 - ROC-AUC
 - PR-AUC
+- expected calibration error (ECE) — kalibrasyon öncesi/sonrası
 - confusion matrix bileşenleri (`tn`, `fp`, `fn`, `tp`)
 
 Model seçimi varsayılan olarak `roc_auc` üzerinden yapılır. Seçilen metrik hesaplanamazsa sırasıyla `pr_auc`, `balanced_accuracy`, `f1` ve negatif loss değerine düşülür.

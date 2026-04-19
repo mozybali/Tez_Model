@@ -15,8 +15,10 @@ from Model.resnet3d import build_resnet3d
 from Preprocessing.dataset import AlanKidneyDataset, infer_positive_class_weight, load_records, split_records
 from Preprocessing.transforms import build_train_augmentations
 from Utils.calibration import (
+    apply_isotonic,
     apply_temperature,
     expected_calibration_error,
+    fit_isotonic,
     fit_temperature,
     logits_from_probs,
     reliability_bins,
@@ -402,17 +404,27 @@ def run_epoch(
     return metrics
 
 
+_TTA_FLIP_DIMS: tuple[tuple[int, ...], ...] = ((), (2,), (3,), (4,), (3, 4))
+
+
 def collect_predictions(
     model: nn.Module,
     dataloader: DataLoader,
     device: torch.device,
     tabular_feature_stats: dict[str, float] | None = None,
+    tta_enabled: bool = False,
 ) -> dict[str, list[float]]:
-    """Run inference and return y_true / y_logit / y_prob lists."""
+    """Run inference and return y_true / y_logit / y_prob lists.
+
+    When ``tta_enabled`` is True, we average logits across identity and spatial
+    flips — this typically adds a couple of recall points on the anomaly class
+    at the cost of roughly 5× inference time.
+    """
     model.eval()
     y_true: list[float] = []
     y_prob: list[float] = []
     y_logit: list[float] = []
+    flip_dims_list = _TTA_FLIP_DIMS if tta_enabled else ((),)
     with torch.no_grad():
         for batch in dataloader:
             volumes = batch["volume"].to(device, non_blocking=True)
@@ -420,9 +432,15 @@ def collect_predictions(
             tabular_features = None
             if tabular_feature_stats is not None:
                 tabular_features = build_tabular_features(batch, tabular_feature_stats, device)
-            logits = model(volumes, tabular_features=tabular_features)
-            logits_cpu = logits.detach().float().cpu().tolist()
-            probs = torch.sigmoid(logits.detach().float()).cpu().tolist()
+            accum_logits: torch.Tensor | None = None
+            for flip_dims in flip_dims_list:
+                volumes_view = torch.flip(volumes, dims=list(flip_dims)) if flip_dims else volumes
+                logits = model(volumes_view, tabular_features=tabular_features).detach().float()
+                accum_logits = logits if accum_logits is None else accum_logits + logits
+            assert accum_logits is not None
+            mean_logits = accum_logits / float(len(flip_dims_list))
+            logits_cpu = mean_logits.cpu().tolist()
+            probs = torch.sigmoid(mean_logits).cpu().tolist()
             y_logit.extend(logits_cpu if isinstance(logits_cpu, list) else [logits_cpu])
             y_prob.extend(probs if isinstance(probs, list) else [probs])
             ground = labels.detach().cpu().tolist()
@@ -568,14 +586,24 @@ def run_training(
         model.load_state_dict(checkpoint["model_state_dict"])
 
     # Collect validation predictions once; reuse for calibration, threshold selection, and plots.
-    val_preds = collect_predictions(model, dataloaders["val"], device, tabular_feature_stats)
+    tta_enabled = bool(getattr(train_config, "tta_enabled", False))
+    val_preds = collect_predictions(
+        model, dataloaders["val"], device, tabular_feature_stats, tta_enabled=tta_enabled,
+    )
     val_logits_np = np.asarray(val_preds.get("y_logit") or logits_from_probs(np.asarray(val_preds["y_prob"])))
     val_labels_np = np.asarray(val_preds["y_true"], dtype=np.float64)
 
-    # ── Post-hoc temperature calibration on val ──────────────────────
+    # ── Post-hoc calibration on val ──────────────────────────────────
+    calibration_method = getattr(train_config, "calibration_method", "temperature").lower()
+    use_temperature = (
+        getattr(train_config, "calibrate_temperature", True)
+        and "temperature" in calibration_method
+    )
+    use_isotonic = "isotonic" in calibration_method
+
     calibration_summary: dict[str, float] = {}
     temperature = 1.0
-    if getattr(train_config, "calibrate_temperature", True):
+    if use_temperature:
         temp_result = fit_temperature(val_logits_np, val_labels_np)
         temperature = float(temp_result.temperature)
         calibration_summary = {
@@ -591,17 +619,34 @@ def run_training(
                 f"ECE {temp_result.ece_before:.4f} -> {temp_result.ece_after:.4f}"
             )
 
-    val_probs_cal = apply_temperature(val_logits_np, temperature)
+    val_probs_after_temp = apply_temperature(val_logits_np, temperature)
+
+    isotonic_result = None
+    if use_isotonic:
+        isotonic_result = fit_isotonic(val_probs_after_temp, val_labels_np)
+        calibration_summary.update({
+            "isotonic_ece_before": isotonic_result.ece_before,
+            "isotonic_ece_after": isotonic_result.ece_after,
+        })
+        if not quiet:
+            print(
+                f"  Isotonic calibration: ECE "
+                f"{isotonic_result.ece_before:.4f} -> {isotonic_result.ece_after:.4f}"
+            )
+        val_probs_cal = apply_isotonic(val_probs_after_temp, isotonic_result)
+    else:
+        val_probs_cal = val_probs_after_temp
 
     # ── Threshold selection: fixed, single-split, and bootstrap-median ──
     threshold_method = getattr(train_config, "threshold_selection", "youden")
+    threshold_beta = float(getattr(train_config, "threshold_fbeta", 1.0))
     fixed_threshold = float(train_config.decision_threshold)
     if threshold_method == "fixed":
         optimal_threshold = fixed_threshold
     else:
         optimal_threshold = select_threshold_bootstrap(
             val_preds["y_true"], val_probs_cal.tolist(),
-            method=threshold_method, seed=train_config.seed,
+            method=threshold_method, seed=train_config.seed, beta=threshold_beta,
         )
     if not quiet:
         print(
@@ -622,6 +667,7 @@ def run_training(
     reliability_cal = reliability_bins(val_probs_cal.tolist(), val_preds["y_true"])
     calibration_payload = {
         "temperature": temperature,
+        "calibration_method": calibration_method,
         "summary": calibration_summary,
         "ece_val_uncalibrated": expected_calibration_error(val_preds["y_prob"], val_preds["y_true"]),
         "ece_val_calibrated": expected_calibration_error(val_probs_cal.tolist(), val_preds["y_true"]),
@@ -631,10 +677,14 @@ def run_training(
         "val_metrics_tuned_threshold": val_metrics_tuned,
         "fixed_threshold": fixed_threshold,
         "tuned_threshold": optimal_threshold,
+        "tta_enabled": tta_enabled,
         "val_y_true": val_preds["y_true"],
         "val_y_prob_uncalibrated": val_preds["y_prob"],
         "val_y_prob_calibrated": val_probs_cal.tolist(),
     }
+    if isotonic_result is not None:
+        calibration_payload["isotonic_x"] = list(isotonic_result.x)
+        calibration_payload["isotonic_y"] = list(isotonic_result.y)
     save_json(calibration_payload, output_dir / "calibration.json")
 
     test_metrics: dict[str, float] = {}
@@ -644,11 +694,17 @@ def run_training(
 
     if not skip_test:
         # Raw test predictions, then apply calibration for reported metrics.
-        test_preds = collect_predictions(model, dataloaders["test"], device, tabular_feature_stats)
+        test_preds = collect_predictions(
+            model, dataloaders["test"], device, tabular_feature_stats, tta_enabled=tta_enabled,
+        )
         test_logits_np = np.asarray(
             test_preds.get("y_logit") or logits_from_probs(np.asarray(test_preds["y_prob"]))
         )
-        test_probs_cal = apply_temperature(test_logits_np, temperature)
+        test_probs_after_temp = apply_temperature(test_logits_np, temperature)
+        if isotonic_result is not None:
+            test_probs_cal = apply_isotonic(test_probs_after_temp, isotonic_result)
+        else:
+            test_probs_cal = test_probs_after_temp
 
         # Compute loss on the test set (AMP off for numerical parity).
         _, _, test_loss = _run_epoch_raw(

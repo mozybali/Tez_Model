@@ -42,8 +42,16 @@ def parse_args() -> argparse.Namespace:
                         help="Use inverse-frequency WeightedRandomSampler for training.")
     parser.add_argument("--disable-calibration", action="store_true",
                         help="Disable post-hoc temperature scaling.")
-    parser.add_argument("--threshold-selection", choices=["youden", "f1", "fixed"], default="youden",
+    parser.add_argument("--threshold-selection", choices=["youden", "f1", "fbeta", "fixed"], default="youden",
                         help="How to pick the decision threshold on the validation set.")
+    parser.add_argument("--threshold-fbeta", type=float, default=1.0,
+                        help="Beta for fbeta threshold selection (>1 weights recall).")
+    parser.add_argument("--calibration-method",
+                        choices=["temperature", "isotonic", "temperature+isotonic"],
+                        default="temperature",
+                        help="Post-hoc probability calibration strategy.")
+    parser.add_argument("--tta", action="store_true",
+                        help="Enable flip-based test-time augmentation during evaluation.")
     parser.add_argument("--disable-augmentations", action="store_true")
     parser.add_argument("--disable-amp", action="store_true")
     parser.add_argument("--disable-bbox-crop", action="store_true")
@@ -143,6 +151,9 @@ def main() -> None:
         use_weighted_sampler=args.use_weighted_sampler,
         calibrate_temperature=not args.disable_calibration,
         threshold_selection=args.threshold_selection,
+        threshold_fbeta=args.threshold_fbeta,
+        calibration_method=args.calibration_method,
+        tta_enabled=args.tta,
     )
 
     if train_config.cv_folds > 1:

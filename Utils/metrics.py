@@ -54,12 +54,14 @@ def optimize_threshold(
     y_true: list[float] | np.ndarray,
     y_prob: list[float] | np.ndarray,
     method: str = "youden",
+    beta: float = 1.0,
 ) -> float:
     """Find optimal classification threshold on a validation set.
 
     Methods:
         youden: Maximizes Youden's J statistic (sensitivity + specificity - 1).
         f1:     Maximizes F1 score over a grid of thresholds.
+        fbeta:  Maximizes F_beta (beta>1 weights recall — useful for anomaly recall).
     """
     from sklearn.metrics import roc_curve
 
@@ -75,14 +77,20 @@ def optimize_threshold(
         best_idx = int(np.argmax(j_scores))
         return float(thresholds[best_idx])
 
-    if method == "f1":
-        best_f1 = -1.0
+    if method in ("f1", "fbeta"):
+        b = 1.0 if method == "f1" else float(beta)
+        b2 = b * b
+        best_score = -1.0
         best_thresh = 0.5
-        for thresh in np.linspace(0.1, 0.9, 81):
+        for thresh in np.linspace(0.05, 0.95, 181):
             preds = (y_prob_arr >= thresh).astype(np.int64)
-            f1_val = float(f1_score(y_true_arr, preds, zero_division=0))
-            if f1_val > best_f1:
-                best_f1 = f1_val
+            tp = float(((preds == 1) & (y_true_arr == 1)).sum())
+            fp = float(((preds == 1) & (y_true_arr == 0)).sum())
+            fn = float(((preds == 0) & (y_true_arr == 1)).sum())
+            denom = (1.0 + b2) * tp + b2 * fn + fp
+            score = ((1.0 + b2) * tp / denom) if denom > 0 else 0.0
+            if score > best_score:
+                best_score = score
                 best_thresh = float(thresh)
         return best_thresh
 

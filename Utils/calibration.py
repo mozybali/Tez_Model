@@ -146,6 +146,7 @@ def select_threshold_bootstrap(
     method: str = "youden",
     n_bootstrap: int = 200,
     seed: int = 42,
+    beta: float = 1.0,
 ) -> float:
     """Bootstrap-averaged threshold selection — more stable than a single split."""
     from Utils.metrics import optimize_threshold
@@ -164,7 +165,57 @@ def select_threshold_bootstrap(
         bt_prob = y_prob_arr[idx]
         if len(np.unique(bt_true)) < 2:
             continue
-        thresholds.append(optimize_threshold(bt_true.tolist(), bt_prob.tolist(), method=method))
+        thresholds.append(
+            optimize_threshold(bt_true.tolist(), bt_prob.tolist(), method=method, beta=beta)
+        )
     if not thresholds:
-        return optimize_threshold(y_true_arr.tolist(), y_prob_arr.tolist(), method=method)
+        return optimize_threshold(
+            y_true_arr.tolist(), y_prob_arr.tolist(), method=method, beta=beta,
+        )
     return float(np.median(thresholds))
+
+
+@dataclass(frozen=True, slots=True)
+class IsotonicResult:
+    """Monotone piecewise-linear probability calibration fitted on held-out logits."""
+    x: tuple[float, ...]
+    y: tuple[float, ...]
+    ece_before: float
+    ece_after: float
+
+
+def fit_isotonic(
+    probs: np.ndarray | list[float],
+    labels: np.ndarray | list[float],
+) -> IsotonicResult:
+    """Fit isotonic regression p_calibrated = f(p_raw). Robust when temperature
+    scaling isn't enough (e.g. bimodal logit distribution, skewed confidence)."""
+    from sklearn.isotonic import IsotonicRegression
+
+    probs_arr = np.asarray(probs, dtype=np.float64).reshape(-1)
+    labels_arr = np.asarray(labels, dtype=np.float64).reshape(-1)
+    ece_before = expected_calibration_error(probs_arr, labels_arr)
+    if probs_arr.size == 0 or len(np.unique(labels_arr)) < 2:
+        return IsotonicResult(tuple(probs_arr.tolist()), tuple(labels_arr.tolist()), ece_before, ece_before)
+
+    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    iso.fit(probs_arr, labels_arr)
+    calibrated = iso.predict(probs_arr)
+    ece_after = expected_calibration_error(calibrated, labels_arr)
+    return IsotonicResult(
+        x=tuple(float(v) for v in iso.X_thresholds_),
+        y=tuple(float(v) for v in iso.y_thresholds_),
+        ece_before=ece_before,
+        ece_after=ece_after,
+    )
+
+
+def apply_isotonic(probs: np.ndarray | list[float], result: IsotonicResult) -> np.ndarray:
+    """Apply a fitted isotonic mapping to new probabilities."""
+    arr = np.asarray(probs, dtype=np.float64).reshape(-1)
+    if not result.x:
+        return arr
+    xs = np.asarray(result.x, dtype=np.float64)
+    ys = np.asarray(result.y, dtype=np.float64)
+    clipped = np.clip(arr, xs[0], xs[-1])
+    return np.clip(np.interp(clipped, xs, ys), 0.0, 1.0)
