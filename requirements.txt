@@ -1,6 +1,8 @@
 numpy>=1.24
 scikit-learn>=1.0
-torch>=2.0
+# PyTorch CUDA 12.8 wheels for NVIDIA GPU acceleration.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
 optuna>=3.0
 matplotlib>=3.5
 pytest>=7.0

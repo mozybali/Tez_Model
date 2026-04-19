@@ -15,7 +15,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metadata-csv", type=Path, default=Path("ALAN/metadata.csv"))
     parser.add_argument("--summary-json", type=Path, default=Path("ALAN/summary.json"))
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/baseline"))
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
@@ -32,9 +32,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bbox-margin", type=int, default=8)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--patience", type=int, default=7)
-    parser.add_argument("--gradient-clip-norm", type=float, default=0.5)
+    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
     parser.add_argument("--decision-threshold", type=float, default=0.5)
+    parser.add_argument("--norm-type", choices=["batch", "group"], default="batch",
+                        help="batch: BatchNorm3D. group: GroupNorm (better for small batch_size).")
+    parser.add_argument("--group-norm-groups", type=int, default=8)
+    parser.add_argument("--use-weighted-sampler", action="store_true",
+                        help="Use inverse-frequency WeightedRandomSampler for training.")
+    parser.add_argument("--disable-calibration", action="store_true",
+                        help="Disable post-hoc temperature scaling.")
+    parser.add_argument("--threshold-selection", choices=["youden", "f1", "fixed"], default="youden",
+                        help="How to pick the decision threshold on the validation set.")
     parser.add_argument("--disable-augmentations", action="store_true")
     parser.add_argument("--disable-amp", action="store_true")
     parser.add_argument("--disable-bbox-crop", action="store_true")
@@ -106,6 +115,8 @@ def main() -> None:
         dropout=args.dropout,
         use_tabular_features=not args.disable_tabular_features,
         tabular_hidden_dim=args.tabular_hidden_dim,
+        norm_type=args.norm_type,
+        group_norm_groups=args.group_norm_groups,
     )
     train_config = TrainConfig(
         output_dir=args.output_dir,
@@ -129,6 +140,9 @@ def main() -> None:
         loss_type=args.loss_type,
         focal_gamma=args.focal_gamma,
         cv_folds=args.cv_folds,
+        use_weighted_sampler=args.use_weighted_sampler,
+        calibrate_temperature=not args.disable_calibration,
+        threshold_selection=args.threshold_selection,
     )
 
     if train_config.cv_folds > 1:

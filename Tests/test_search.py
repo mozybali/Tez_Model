@@ -9,6 +9,7 @@ from Model.search import (
     _epoch_choices,
     _flip_axes_from_choice,
     _patience_choices,
+    _resolve_flip_axes,
 )
 
 
@@ -46,6 +47,63 @@ class FlipAxesFromChoiceTest(unittest.TestCase):
 
     def test_none_returns_fallback(self) -> None:
         self.assertEqual(_flip_axes_from_choice(None, (1, 2)), (1, 2))
+
+
+class ResolveFlipAxesTest(unittest.TestCase):
+    """When canonicalize_right is True, the canonicalization axis must be excluded
+    from augmentation flips — otherwise the random flip undoes the L→R alignment."""
+
+    def test_removes_canonical_axis(self) -> None:
+        self.assertEqual(_resolve_flip_axes("0_2", (1, 2), True, 2), (0,))
+
+    def test_removes_canonical_axis_single(self) -> None:
+        self.assertEqual(_resolve_flip_axes("2", (1, 2), True, 2), ())
+
+    def test_keeps_all_axes_when_not_canonicalizing(self) -> None:
+        self.assertEqual(_resolve_flip_axes("0_2", (1, 2), False, 2), (0, 2))
+
+    def test_other_axes_untouched(self) -> None:
+        self.assertEqual(_resolve_flip_axes("0_1_2", (1, 2), True, 1), (0, 2))
+
+    def test_fallback_respected_when_choice_none(self) -> None:
+        self.assertEqual(_resolve_flip_axes(None, (1, 2), True, 2), (1,))
+
+
+class ConfigsFromParamsFlipAxisResolutionTest(unittest.TestCase):
+    """Params reconstruction must also drop the canonicalization axis from flips."""
+
+    def test_drops_canonical_axis_in_replay(self) -> None:
+        params = {
+            "target_edge": 64,
+            "use_bbox_crop": True,
+            "bbox_margin": 8,
+            "pad_to_cube": True,
+            "canonicalize_right": True,
+            "right_flip_axis": 2,
+            "nan_strategy": "none",
+            "augmentations_enabled": True,
+            "flip_probability": 0.5,
+            "flip_axes": "0_2",
+            "affine_probability": 0.6,
+            "rotation_degrees": 10.0,
+            "translation_fraction": 0.05,
+            "scale_min": 0.9,
+            "scale_max": 1.1,
+            "morphology_probability": 0.1,
+            "depth": 18,
+            "base_channels": 32,
+            "dropout": 0.2,
+            "learning_rate": 1e-3,
+            "weight_decay": 1e-4,
+            "optimizer_name": "adamw",
+            "scheduler_name": "cosine",
+            "batch_size": 8,
+            "epochs": 12,
+        }
+        _, aug_cfg, _, _ = _configs_from_params(
+            params, DataConfig(), AugmentationConfig(), ModelConfig(), TrainConfig(), Path("/tmp/test"),
+        )
+        self.assertEqual(aug_cfg.flip_axes, (0,))
 
 
 class ConfigsFromParamsAugEnabledTest(unittest.TestCase):

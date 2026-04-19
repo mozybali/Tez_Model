@@ -132,6 +132,86 @@ def plot_confusion_matrix(ax: plt.Axes, history: list[dict], split: str) -> None
     plt.colorbar(im, ax=ax, shrink=0.8)
 
 
+def plot_pr_curve(ax: plt.Axes, calibration: dict | None) -> None:
+    """Precision-Recall curve on the validation set (uncalibrated vs calibrated)."""
+    if not calibration:
+        ax.axis("off")
+        ax.set_title("PR Curve (veri yok)", fontsize=13, fontweight="bold", pad=10)
+        return
+    try:
+        from sklearn.metrics import average_precision_score, precision_recall_curve
+    except Exception:
+        ax.axis("off")
+        return
+
+    y_true = np.asarray(calibration.get("val_y_true", []), dtype=np.int64)
+    y_prob_uncal = np.asarray(calibration.get("val_y_prob_uncalibrated", []), dtype=np.float64)
+    y_prob_cal = np.asarray(calibration.get("val_y_prob_calibrated", []), dtype=np.float64)
+    if y_true.size == 0 or len(np.unique(y_true)) < 2:
+        ax.axis("off")
+        ax.set_title("PR Curve (yetersiz veri)", fontsize=13, fontweight="bold", pad=10)
+        return
+
+    base_rate = float(y_true.mean())
+    ax.hlines(base_rate, 0, 1, colors="#9E9E9E", linestyles=":", label=f"Baseline ({base_rate:.3f})")
+    for probs, label, color in [
+        (y_prob_uncal, "Uncalibrated", "#FF9800"),
+        (y_prob_cal, "Calibrated (T)", "#4CAF50"),
+    ]:
+        if probs.size == 0:
+            continue
+        precision, recall, _ = precision_recall_curve(y_true, probs)
+        ap = average_precision_score(y_true, probs)
+        ax.plot(recall, precision, color=color, linewidth=2, label=f"{label}  AP={ap:.3f}")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1.02)
+    ax.set_xlabel("Recall", fontsize=11)
+    ax.set_ylabel("Precision", fontsize=11)
+    ax.set_title("PR Curve (Val)", fontsize=13, fontweight="bold", pad=10)
+    ax.grid(True, alpha=0.3, linestyle="--")
+    ax.legend(framealpha=0.9, fontsize=9, loc="lower left")
+
+
+def plot_reliability(ax: plt.Axes, calibration: dict | None) -> None:
+    """Reliability diagram comparing raw vs temperature-calibrated probabilities."""
+    if not calibration:
+        ax.axis("off")
+        ax.set_title("Reliability (veri yok)", fontsize=13, fontweight="bold", pad=10)
+        return
+    uncal = calibration.get("reliability_uncalibrated") or {}
+    cal = calibration.get("reliability_calibrated") or {}
+    if not uncal and not cal:
+        ax.axis("off")
+        return
+
+    ax.plot([0, 1], [0, 1], color="#9E9E9E", linestyle=":", label="Perfect")
+    for bins, label, color in [
+        (uncal, "Uncalibrated", "#FF9800"),
+        (cal, "Calibrated (T)", "#4CAF50"),
+    ]:
+        if not bins:
+            continue
+        conf = np.asarray(bins.get("confidence", []), dtype=np.float64)
+        acc = np.asarray(bins.get("accuracy", []), dtype=np.float64)
+        mask = ~(np.isnan(conf) | np.isnan(acc))
+        if not mask.any():
+            continue
+        ax.plot(conf[mask], acc[mask], color=color, marker="o", linewidth=2, label=label)
+    ece_uncal = calibration.get("ece_val_uncalibrated")
+    ece_cal = calibration.get("ece_val_calibrated")
+    T = calibration.get("temperature", 1.0)
+    subtitle = f"T={T:.2f}"
+    if ece_uncal is not None and ece_cal is not None and not np.isnan(ece_uncal) and not np.isnan(ece_cal):
+        subtitle += f"   ECE {ece_uncal:.3f} -> {ece_cal:.3f}"
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("Predicted Probability (confidence)", fontsize=11)
+    ax.set_ylabel("Empirical Accuracy", fontsize=11)
+    ax.set_title(f"Reliability Diagram — {subtitle}", fontsize=13, fontweight="bold", pad=10)
+    ax.grid(True, alpha=0.3, linestyle="--")
+    ax.legend(framealpha=0.9, fontsize=9, loc="upper left")
+
+
 def plot_summary_table(ax: plt.Axes, history: list[dict]) -> None:
     """Son epoch için tüm metrik değerlerini tablo olarak gösterir."""
     ax.axis("off")
@@ -182,10 +262,18 @@ def generate_plots(history_path: Path, out_dir: Path | None = None, show: bool =
     if out_dir is None:
         out_dir = history_path.parent
 
-    fig = plt.figure(figsize=(20, 24), facecolor="white")
+    calibration: dict | None = None
+    calibration_path = history_path.parent / "calibration.json"
+    if calibration_path.exists():
+        try:
+            calibration = json.loads(calibration_path.read_text())
+        except Exception:
+            calibration = None
+
+    fig = plt.figure(figsize=(20, 30), facecolor="white")
     fig.suptitle("Model Performans Metrikleri", fontsize=18, fontweight="bold", y=0.98)
 
-    gs = fig.add_gridspec(4, 2, hspace=0.35, wspace=0.3, top=0.94, bottom=0.04, left=0.07, right=0.95)
+    gs = fig.add_gridspec(5, 2, hspace=0.38, wspace=0.3, top=0.95, bottom=0.03, left=0.07, right=0.95)
 
     plot_loss(fig.add_subplot(gs[0, 0]), history)
     plot_auc(fig.add_subplot(gs[0, 1]), history)
@@ -193,7 +281,9 @@ def generate_plots(history_path: Path, out_dir: Path | None = None, show: bool =
     plot_prf(fig.add_subplot(gs[1, 1]), history)
     plot_confusion_matrix(fig.add_subplot(gs[2, 0]), history, "train")
     plot_confusion_matrix(fig.add_subplot(gs[2, 1]), history, "val")
-    plot_summary_table(fig.add_subplot(gs[3, :]), history)
+    plot_pr_curve(fig.add_subplot(gs[3, 0]), calibration)
+    plot_reliability(fig.add_subplot(gs[3, 1]), calibration)
+    plot_summary_table(fig.add_subplot(gs[4, :]), history)
 
     out_path = out_dir / "metrics_plot.png"
     fig.savefig(out_path, dpi=150, bbox_inches="tight")

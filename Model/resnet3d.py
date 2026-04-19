@@ -15,22 +15,40 @@ def conv3x3x3(in_channels: int, out_channels: int, stride: int = 1) -> nn.Conv3d
     )
 
 
+def _make_norm(channels: int, norm_type: str, group_norm_groups: int) -> nn.Module:
+    if norm_type == "batch":
+        return nn.BatchNorm3d(channels)
+    if norm_type == "group":
+        groups = max(1, min(group_norm_groups, channels))
+        while channels % groups != 0 and groups > 1:
+            groups -= 1
+        return nn.GroupNorm(num_groups=groups, num_channels=channels)
+    raise ValueError(f"Unsupported norm_type: {norm_type}")
+
+
 class BasicBlock3D(nn.Module):
     expansion = 1
 
-    def __init__(self, in_channels: int, out_channels: int, stride: int = 1) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int = 1,
+        norm_type: str = "batch",
+        group_norm_groups: int = 8,
+    ) -> None:
         super().__init__()
         self.conv1 = conv3x3x3(in_channels, out_channels, stride=stride)
-        self.bn1 = nn.BatchNorm3d(out_channels)
+        self.bn1 = _make_norm(out_channels, norm_type, group_norm_groups)
         self.relu1 = nn.ReLU(inplace=True)
         self.conv2 = conv3x3x3(out_channels, out_channels)
-        self.bn2 = nn.BatchNorm3d(out_channels)
+        self.bn2 = _make_norm(out_channels, norm_type, group_norm_groups)
         self.relu2 = nn.ReLU(inplace=True)
 
         if stride != 1 or in_channels != out_channels:
             self.downsample = nn.Sequential(
                 nn.Conv3d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm3d(out_channels),
+                _make_norm(out_channels, norm_type, group_norm_groups),
             )
         else:
             self.downsample = nn.Identity()
@@ -58,14 +76,18 @@ class ResNet3D(nn.Module):
         num_classes: int = 1,
         num_tabular_features: int = 0,
         tabular_hidden_dim: int = 16,
+        norm_type: str = "batch",
+        group_norm_groups: int = 8,
     ) -> None:
         super().__init__()
         self.in_channels = base_channels
         self.num_tabular_features = int(num_tabular_features)
+        self.norm_type = norm_type
+        self.group_norm_groups = int(group_norm_groups)
 
         self.stem = nn.Sequential(
             nn.Conv3d(in_channels, base_channels, kernel_size=7, stride=2, padding=3, bias=False),
-            nn.BatchNorm3d(base_channels),
+            _make_norm(base_channels, norm_type, group_norm_groups),
             nn.ReLU(inplace=True),
             nn.MaxPool3d(kernel_size=3, stride=2, padding=1),
         )
@@ -105,10 +127,16 @@ class ResNet3D(nn.Module):
                     nn.init.constant_(module.bias, 0)
 
     def _make_layer(self, out_channels: int, blocks: int, stride: int) -> nn.Sequential:
-        layers = [BasicBlock3D(self.in_channels, out_channels, stride=stride)]
+        layers = [BasicBlock3D(
+            self.in_channels, out_channels, stride=stride,
+            norm_type=self.norm_type, group_norm_groups=self.group_norm_groups,
+        )]
         self.in_channels = out_channels
         for _ in range(1, blocks):
-            layers.append(BasicBlock3D(self.in_channels, out_channels))
+            layers.append(BasicBlock3D(
+                self.in_channels, out_channels,
+                norm_type=self.norm_type, group_norm_groups=self.group_norm_groups,
+            ))
         return nn.Sequential(*layers)
 
     def forward(self, inputs: torch.Tensor, tabular_features: torch.Tensor | None = None) -> torch.Tensor:
@@ -145,6 +173,8 @@ def build_resnet3d(
     num_classes: int = 1,
     num_tabular_features: int = 0,
     tabular_hidden_dim: int = 16,
+    norm_type: str = "batch",
+    group_norm_groups: int = 8,
 ) -> ResNet3D:
     variants = {
         18: (2, 2, 2, 2),
@@ -160,4 +190,6 @@ def build_resnet3d(
         num_classes=num_classes,
         num_tabular_features=num_tabular_features,
         tabular_hidden_dim=tabular_hidden_dim,
+        norm_type=norm_type,
+        group_norm_groups=group_norm_groups,
     )

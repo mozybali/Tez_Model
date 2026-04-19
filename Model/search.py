@@ -40,8 +40,14 @@ def _epoch_choices(max_epochs: int) -> list[int]:
 
 
 def _patience_choices(max_epochs: int) -> list[int]:
+    """Patience budget: favor longer patience so training isn't cut short.
+
+    We avoid patience < 5 because prior runs stopped at epoch 10 and still had
+    room to improve. The lower bound scales with max_epochs.
+    """
     max_epochs = max(1, int(max_epochs))
-    candidates = {2, 3, 5, 6, 8, 10, max(1, int(round(max_epochs * 0.5)))}
+    lower = max(5, int(round(max_epochs * 0.25)))
+    candidates = {lower, 8, 10, 12, 15, max(1, int(round(max_epochs * 0.5)))}
     return sorted(choice for choice in candidates if choice <= max_epochs) or [max_epochs]
 
 
@@ -49,6 +55,18 @@ def _flip_axes_from_choice(choice: str | None, fallback: tuple[int, ...]) -> tup
     if choice is None:
         return fallback
     return _FLIP_AXIS_CHOICES[choice]
+
+
+def _resolve_flip_axes(
+    choice: str | None,
+    fallback: tuple[int, ...],
+    canonicalize_right: bool,
+    right_flip_axis: int,
+) -> tuple[int, ...]:
+    axes = _flip_axes_from_choice(choice, fallback)
+    if canonicalize_right:
+        axes = tuple(axis for axis in axes if axis != right_flip_axis)
+    return axes
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,14 +82,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--epochs",
         type=int,
-        default=12,
+        default=30,
         help="Maximum per-trial epoch budget; Optuna samples shorter budgets up to this value.",
     )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--patience", type=int, default=6)
+    parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
     parser.add_argument("--disable-amp", action="store_true")
     parser.add_argument("--disable-tabular-features", action="store_true")
@@ -139,7 +157,12 @@ def _sample_trial_configs(
             base_aug,
             enabled=True,
             flip_probability=trial.suggest_float("flip_probability", 0.2, 0.7),
-            flip_axes=_flip_axes_from_choice(flip_axes_choice, base_aug.flip_axes),
+            flip_axes=_resolve_flip_axes(
+                flip_axes_choice,
+                base_aug.flip_axes,
+                canonicalize_right,
+                right_flip_axis,
+            ),
             affine_probability=trial.suggest_float("affine_probability", 0.3, 0.8),
             rotation_degrees=trial.suggest_float("rotation_degrees", 4.0, 15.0),
             translation_fraction=trial.suggest_float("translation_fraction", 0.02, 0.10),
@@ -161,6 +184,8 @@ def _sample_trial_configs(
             if use_tabular_features
             else base_model.tabular_hidden_dim
         ),
+        norm_type=trial.suggest_categorical("norm_type", ["batch", "group"]),
+        group_norm_groups=base_model.group_norm_groups,
     )
 
     optimizer_name = trial.suggest_categorical("optimizer_name", ["adam", "adamw", "sgd"])
@@ -170,8 +195,10 @@ def _sample_trial_configs(
         else base_train.sgd_momentum
     )
     scheduler_name = trial.suggest_categorical("scheduler_name", ["cosine", "none"])
+    # Warmup lower bound of 2 (prior run suffered a big loss spike at epoch 2 with only 1 warmup epoch).
+    warmup_upper = max(3, train_epochs // 3)
     warmup_epochs = (
-        trial.suggest_int("warmup_epochs", 0, max(1, train_epochs // 4))
+        trial.suggest_int("warmup_epochs", 2, warmup_upper)
         if scheduler_name != "none"
         else 0
     )
@@ -201,7 +228,11 @@ def _sample_trial_configs(
             "early_stopping_patience",
             _patience_choices(base_train.epochs),
         ),
-        gradient_clip_norm=trial.suggest_categorical("gradient_clip_norm", [0.5, 1.0, 2.0, 5.0]),
+        # Tighter clip bounds — 5.0 was too loose and allowed the loss spike at epoch 2.
+        gradient_clip_norm=trial.suggest_categorical("gradient_clip_norm", [0.25, 0.5, 1.0, 2.0]),
+        use_weighted_sampler=trial.suggest_categorical("use_weighted_sampler", [False, True]),
+        amp=trial.suggest_categorical("amp", [True, False]),
+        threshold_selection=trial.suggest_categorical("threshold_selection", ["youden", "f1"]),
     )
     return data_config, aug_config, model_config, train_config
 
@@ -234,7 +265,12 @@ def _configs_from_params(
             base_aug,
             enabled=True,
             flip_probability=params["flip_probability"],
-            flip_axes=_flip_axes_from_choice(params.get("flip_axes"), base_aug.flip_axes),
+            flip_axes=_resolve_flip_axes(
+                params.get("flip_axes"),
+                base_aug.flip_axes,
+                data_config.canonicalize_right,
+                data_config.right_flip_axis,
+            ),
             affine_probability=params["affine_probability"],
             rotation_degrees=params["rotation_degrees"],
             translation_fraction=params["translation_fraction"],
@@ -251,6 +287,8 @@ def _configs_from_params(
         dropout=params["dropout"],
         use_tabular_features=params.get("use_tabular_features", base_model.use_tabular_features),
         tabular_hidden_dim=params.get("tabular_hidden_dim", base_model.tabular_hidden_dim),
+        norm_type=params.get("norm_type", base_model.norm_type),
+        group_norm_groups=params.get("group_norm_groups", base_model.group_norm_groups),
     )
     train_config = replace(
         base_train,
@@ -268,6 +306,9 @@ def _configs_from_params(
         batch_size=params["batch_size"],
         early_stopping_patience=params.get("early_stopping_patience", base_train.early_stopping_patience),
         gradient_clip_norm=params.get("gradient_clip_norm", base_train.gradient_clip_norm),
+        use_weighted_sampler=params.get("use_weighted_sampler", base_train.use_weighted_sampler),
+        amp=params.get("amp", base_train.amp),
+        threshold_selection=params.get("threshold_selection", base_train.threshold_selection),
     )
     return data_config, aug_config, model_config, train_config
 

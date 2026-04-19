@@ -9,11 +9,19 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from Model.resnet3d import build_resnet3d
 from Preprocessing.dataset import AlanKidneyDataset, infer_positive_class_weight, load_records, split_records
 from Preprocessing.transforms import build_train_augmentations
+from Utils.calibration import (
+    apply_temperature,
+    expected_calibration_error,
+    fit_temperature,
+    logits_from_probs,
+    reliability_bins,
+    select_threshold_bootstrap,
+)
 from Utils.config import AugmentationConfig, DataConfig, ModelConfig, TrainConfig, to_serializable
 from Utils.metrics import bootstrap_confidence_intervals, compute_binary_classification_metrics, optimize_threshold, select_model_score
 from Utils.plot_metrics import generate_plots
@@ -98,6 +106,24 @@ def effective_pin_memory(pin_memory: bool, device: torch.device) -> bool:
     return pin_memory and device.type == "cuda"
 
 
+def _build_weighted_sampler(labels: list[int], seed: int) -> WeightedRandomSampler:
+    """Inverse-frequency WeightedRandomSampler so each minibatch sees balanced classes."""
+    labels_arr = np.asarray(labels, dtype=np.int64)
+    if labels_arr.size == 0:
+        raise ValueError("Cannot build weighted sampler from an empty label list.")
+    counts = np.bincount(labels_arr, minlength=2).astype(np.float64)
+    counts[counts == 0] = 1.0  # avoid div-by-zero for single-class splits
+    per_class_weight = 1.0 / counts
+    sample_weights = per_class_weight[labels_arr]
+    generator = torch.Generator().manual_seed(int(seed))
+    return WeightedRandomSampler(
+        weights=torch.as_tensor(sample_weights, dtype=torch.double),
+        num_samples=len(labels_arr),
+        replacement=True,
+        generator=generator,
+    )
+
+
 def build_dataloaders(
     data_config: DataConfig,
     augmentation_config: AugmentationConfig,
@@ -151,14 +177,23 @@ def build_dataloaders(
 
     generator = torch.Generator().manual_seed(train_config.seed)
     pin_memory = effective_pin_memory(train_config.pin_memory, device)
+
+    train_sampler = None
+    train_shuffle = True
+    if getattr(train_config, "use_weighted_sampler", False):
+        train_labels = [int(record.label) for record in splits["train"]]
+        train_sampler = _build_weighted_sampler(train_labels, seed=train_config.seed)
+        train_shuffle = False
+
     dataloaders = {
         "train": DataLoader(
             datasets["train"],
             batch_size=train_config.batch_size,
-            shuffle=True,
+            shuffle=train_shuffle,
+            sampler=train_sampler,
             num_workers=train_config.num_workers,
             pin_memory=pin_memory,
-            generator=generator,
+            generator=generator if train_sampler is None else None,
         ),
         "val": DataLoader(
             datasets["val"],
@@ -373,10 +408,11 @@ def collect_predictions(
     device: torch.device,
     tabular_feature_stats: dict[str, float] | None = None,
 ) -> dict[str, list[float]]:
-    """Run inference and return raw y_true / y_prob lists."""
+    """Run inference and return y_true / y_logit / y_prob lists."""
     model.eval()
     y_true: list[float] = []
     y_prob: list[float] = []
+    y_logit: list[float] = []
     with torch.no_grad():
         for batch in dataloader:
             volumes = batch["volume"].to(device, non_blocking=True)
@@ -385,11 +421,13 @@ def collect_predictions(
             if tabular_feature_stats is not None:
                 tabular_features = build_tabular_features(batch, tabular_feature_stats, device)
             logits = model(volumes, tabular_features=tabular_features)
-            probs = torch.sigmoid(logits.detach()).cpu().tolist()
+            logits_cpu = logits.detach().float().cpu().tolist()
+            probs = torch.sigmoid(logits.detach().float()).cpu().tolist()
+            y_logit.extend(logits_cpu if isinstance(logits_cpu, list) else [logits_cpu])
             y_prob.extend(probs if isinstance(probs, list) else [probs])
             ground = labels.detach().cpu().tolist()
             y_true.extend(ground if isinstance(ground, list) else [ground])
-    return {"y_true": y_true, "y_prob": y_prob}
+    return {"y_true": y_true, "y_prob": y_prob, "y_logit": y_logit}
 
 
 def run_training(
@@ -424,6 +462,8 @@ def run_training(
         num_classes=model_config.num_classes,
         num_tabular_features=len(TABULAR_FEATURE_NAMES) if model_config.use_tabular_features else 0,
         tabular_hidden_dim=model_config.tabular_hidden_dim,
+        norm_type=getattr(model_config, "norm_type", "batch"),
+        group_norm_groups=getattr(model_config, "group_norm_groups", 8),
     ).to(device)
 
     pos_weight = compute_pos_weight(splits["train"], train_config.pos_weight_strategy)
@@ -527,33 +567,119 @@ def run_training(
         checkpoint = torch.load(best_checkpoint, map_location=device, weights_only=True)
         model.load_state_dict(checkpoint["model_state_dict"])
 
-    # Optimize decision threshold on validation set
+    # Collect validation predictions once; reuse for calibration, threshold selection, and plots.
     val_preds = collect_predictions(model, dataloaders["val"], device, tabular_feature_stats)
-    optimal_threshold = optimize_threshold(val_preds["y_true"], val_preds["y_prob"], method="youden")
+    val_logits_np = np.asarray(val_preds.get("y_logit") or logits_from_probs(np.asarray(val_preds["y_prob"])))
+    val_labels_np = np.asarray(val_preds["y_true"], dtype=np.float64)
+
+    # ── Post-hoc temperature calibration on val ──────────────────────
+    calibration_summary: dict[str, float] = {}
+    temperature = 1.0
+    if getattr(train_config, "calibrate_temperature", True):
+        temp_result = fit_temperature(val_logits_np, val_labels_np)
+        temperature = float(temp_result.temperature)
+        calibration_summary = {
+            "temperature": temperature,
+            "nll_before": temp_result.nll_before,
+            "nll_after": temp_result.nll_after,
+            "ece_before": temp_result.ece_before,
+            "ece_after": temp_result.ece_after,
+        }
+        if not quiet:
+            print(
+                f"  Temperature scaling: T={temperature:.4f}  "
+                f"ECE {temp_result.ece_before:.4f} -> {temp_result.ece_after:.4f}"
+            )
+
+    val_probs_cal = apply_temperature(val_logits_np, temperature)
+
+    # ── Threshold selection: fixed, single-split, and bootstrap-median ──
+    threshold_method = getattr(train_config, "threshold_selection", "youden")
+    fixed_threshold = float(train_config.decision_threshold)
+    if threshold_method == "fixed":
+        optimal_threshold = fixed_threshold
+    else:
+        optimal_threshold = select_threshold_bootstrap(
+            val_preds["y_true"], val_probs_cal.tolist(),
+            method=threshold_method, seed=train_config.seed,
+        )
     if not quiet:
-        print(f"  Optimized threshold: {optimal_threshold:.4f} (was {train_config.decision_threshold:.4f})")
+        print(
+            f"  Threshold — fixed: {fixed_threshold:.4f}  "
+            f"bootstrap_{threshold_method}: {optimal_threshold:.4f}"
+        )
+
+    # Store val metrics at both thresholds (calibrated probabilities)
+    val_metrics_fixed = compute_binary_classification_metrics(
+        val_preds["y_true"], val_probs_cal.tolist(), threshold=fixed_threshold,
+    )
+    val_metrics_tuned = compute_binary_classification_metrics(
+        val_preds["y_true"], val_probs_cal.tolist(), threshold=optimal_threshold,
+    )
+
+    # Reliability diagram data for plots
+    reliability_uncal = reliability_bins(val_preds["y_prob"], val_preds["y_true"])
+    reliability_cal = reliability_bins(val_probs_cal.tolist(), val_preds["y_true"])
+    calibration_payload = {
+        "temperature": temperature,
+        "summary": calibration_summary,
+        "ece_val_uncalibrated": expected_calibration_error(val_preds["y_prob"], val_preds["y_true"]),
+        "ece_val_calibrated": expected_calibration_error(val_probs_cal.tolist(), val_preds["y_true"]),
+        "reliability_uncalibrated": reliability_uncal,
+        "reliability_calibrated": reliability_cal,
+        "val_metrics_fixed_threshold": val_metrics_fixed,
+        "val_metrics_tuned_threshold": val_metrics_tuned,
+        "fixed_threshold": fixed_threshold,
+        "tuned_threshold": optimal_threshold,
+        "val_y_true": val_preds["y_true"],
+        "val_y_prob_uncalibrated": val_preds["y_prob"],
+        "val_y_prob_calibrated": val_probs_cal.tolist(),
+    }
+    save_json(calibration_payload, output_dir / "calibration.json")
 
     test_metrics: dict[str, float] = {}
+    test_metrics_fixed: dict[str, float] = {}
     test_ci: dict = {}
+    test_payload: dict = {}
 
     if not skip_test:
-        test_metrics = run_epoch(
-            model=model,
-            dataloader=dataloaders["test"],
-            criterion=criterion,
-            optimizer=None,
-            device=device,
-            amp_enabled=False,
-            decision_threshold=optimal_threshold,
+        # Raw test predictions, then apply calibration for reported metrics.
+        test_preds = collect_predictions(model, dataloaders["test"], device, tabular_feature_stats)
+        test_logits_np = np.asarray(
+            test_preds.get("y_logit") or logits_from_probs(np.asarray(test_preds["y_prob"]))
+        )
+        test_probs_cal = apply_temperature(test_logits_np, temperature)
+
+        # Compute loss on the test set (AMP off for numerical parity).
+        _, _, test_loss = _run_epoch_raw(
+            model=model, dataloader=dataloaders["test"], criterion=criterion,
+            optimizer=None, device=device, amp_enabled=False,
             tabular_feature_stats=tabular_feature_stats,
         )
 
-        # Bootstrap confidence intervals on test set
-        test_preds = collect_predictions(model, dataloaders["test"], device, tabular_feature_stats)
+        test_metrics_fixed = compute_binary_classification_metrics(
+            test_preds["y_true"], test_probs_cal.tolist(), threshold=fixed_threshold,
+        )
+        test_metrics_fixed["loss"] = test_loss
+        test_metrics = compute_binary_classification_metrics(
+            test_preds["y_true"], test_probs_cal.tolist(), threshold=optimal_threshold,
+        )
+        test_metrics["loss"] = test_loss
+
         test_ci = bootstrap_confidence_intervals(
-            test_preds["y_true"], test_preds["y_prob"],
+            test_preds["y_true"], test_probs_cal.tolist(),
             threshold=optimal_threshold, seed=train_config.seed,
         )
+        test_payload = {
+            "y_true": test_preds["y_true"],
+            "y_prob_uncalibrated": test_preds["y_prob"],
+            "y_prob_calibrated": test_probs_cal.tolist(),
+            "temperature": temperature,
+            "fixed_threshold": fixed_threshold,
+            "tuned_threshold": optimal_threshold,
+            "ece_uncalibrated": expected_calibration_error(test_preds["y_prob"], test_preds["y_true"]),
+            "ece_calibrated": expected_calibration_error(test_probs_cal.tolist(), test_preds["y_true"]),
+        }
 
     config_payload = {
         "data": to_serializable(data_config),
@@ -562,6 +688,8 @@ def run_training(
         "train": to_serializable(train_config),
         "positive_class_weight": pos_weight,
         "optimal_threshold": optimal_threshold,
+        "fixed_threshold": fixed_threshold,
+        "temperature": temperature,
         "tabular_feature_names": list(TABULAR_FEATURE_NAMES) if model_config.use_tabular_features else [],
         "tabular_feature_stats": tabular_feature_stats,
     }
@@ -570,6 +698,10 @@ def run_training(
     save_json(best_val_metrics, output_dir / "best_val_metrics.json")
     if test_metrics:
         save_json(test_metrics, output_dir / "test_metrics.json")
+    if test_metrics_fixed:
+        save_json(test_metrics_fixed, output_dir / "test_metrics_fixed_threshold.json")
+    if test_payload:
+        save_json(test_payload, output_dir / "test_predictions.json")
     if test_ci:
         save_json(test_ci, output_dir / "test_confidence_intervals.json")
 
@@ -599,8 +731,11 @@ def run_training(
         "best_score": best_score,
         "best_val_metrics": best_val_metrics,
         "test_metrics": test_metrics,
+        "test_metrics_fixed_threshold": test_metrics_fixed,
         "test_confidence_intervals": test_ci,
         "optimal_threshold": optimal_threshold,
+        "fixed_threshold": fixed_threshold,
+        "temperature": temperature,
         "checkpoint_path": str(best_checkpoint),
     }
 
@@ -692,9 +827,23 @@ def run_cross_validation(
         }
         generator = torch.Generator().manual_seed(fold_train_config.seed + fold_idx)
         pin_memory = effective_pin_memory(fold_train_config.pin_memory, device)
+
+        fold_sampler = None
+        fold_shuffle = True
+        if getattr(fold_train_config, "use_weighted_sampler", False):
+            fold_sampler = _build_weighted_sampler(
+                [int(r.label) for r in fold_train],
+                seed=fold_train_config.seed + fold_idx,
+            )
+            fold_shuffle = False
+
         dataloaders = {
-            "train": DataLoader(datasets["train"], batch_size=fold_train_config.batch_size, shuffle=True,
-                                num_workers=fold_train_config.num_workers, pin_memory=pin_memory, generator=generator),
+            "train": DataLoader(
+                datasets["train"], batch_size=fold_train_config.batch_size,
+                shuffle=fold_shuffle, sampler=fold_sampler,
+                num_workers=fold_train_config.num_workers, pin_memory=pin_memory,
+                generator=generator if fold_sampler is None else None,
+            ),
             "val": DataLoader(datasets["val"], batch_size=fold_train_config.batch_size, shuffle=False,
                               num_workers=fold_train_config.num_workers, pin_memory=pin_memory),
         }
@@ -708,6 +857,8 @@ def run_cross_validation(
             num_classes=model_config.num_classes,
             num_tabular_features=len(TABULAR_FEATURE_NAMES) if model_config.use_tabular_features else 0,
             tabular_hidden_dim=model_config.tabular_hidden_dim,
+            norm_type=getattr(model_config, "norm_type", "batch"),
+            group_norm_groups=getattr(model_config, "group_norm_groups", 8),
         ).to(device)
 
         pos_weight = compute_pos_weight(fold_train, fold_train_config.pos_weight_strategy)

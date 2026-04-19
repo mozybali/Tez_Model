@@ -85,6 +85,8 @@ class ModelConfig:
     num_classes: int = 1
     use_tabular_features: bool = True
     tabular_hidden_dim: int = 16
+    norm_type: str = "batch"  # "batch" or "group" — group helps when batch_size is small.
+    group_norm_groups: int = 8
 
 
 @dataclass(slots=True)
@@ -101,8 +103,8 @@ class TrainConfig:
     scheduler_name: str = "cosine"
     device: str = "auto"
     seed: int = 42
-    early_stopping_patience: int = 7
-    gradient_clip_norm: float | None = 0.5
+    early_stopping_patience: int = 10
+    gradient_clip_norm: float | None = 1.0
     decision_threshold: float = 0.5
     primary_metric: str = "pr_auc"
     amp: bool = True
@@ -111,6 +113,9 @@ class TrainConfig:
     loss_type: str = "bce"
     focal_gamma: float = 2.0
     cv_folds: int = 0
+    use_weighted_sampler: bool = False
+    calibrate_temperature: bool = True
+    threshold_selection: str = "youden"  # "youden", "f1", or "fixed"
 
 
 @dataclass(slots=True)
