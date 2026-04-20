@@ -11,7 +11,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
-from Model.resnet3d import build_resnet3d
+from Model.factory import build_model
 from Preprocessing.dataset import AlanKidneyDataset, infer_positive_class_weight, load_records, split_records
 from Preprocessing.transforms import build_train_augmentations
 from Utils.calibration import (
@@ -472,16 +472,9 @@ def run_training(
         compute_tabular_feature_stats(splits["train"]) if model_config.use_tabular_features else None
     )
 
-    model = build_resnet3d(
-        depth=model_config.depth,
-        in_channels=model_config.in_channels,
-        base_channels=model_config.base_channels,
-        dropout=model_config.dropout,
-        num_classes=model_config.num_classes,
+    model = build_model(
+        model_config=model_config,
         num_tabular_features=len(TABULAR_FEATURE_NAMES) if model_config.use_tabular_features else 0,
-        tabular_hidden_dim=model_config.tabular_hidden_dim,
-        norm_type=getattr(model_config, "norm_type", "batch"),
-        group_norm_groups=getattr(model_config, "group_norm_groups", 8),
     ).to(device)
 
     pos_weight = compute_pos_weight(splits["train"], train_config.pos_weight_strategy)
@@ -907,14 +900,9 @@ def run_cross_validation(
         tabular_feature_stats = (
             compute_tabular_feature_stats(fold_train) if model_config.use_tabular_features else None
         )
-        model = build_resnet3d(
-            depth=model_config.depth, in_channels=model_config.in_channels,
-            base_channels=model_config.base_channels, dropout=model_config.dropout,
-            num_classes=model_config.num_classes,
+        model = build_model(
+            model_config=model_config,
             num_tabular_features=len(TABULAR_FEATURE_NAMES) if model_config.use_tabular_features else 0,
-            tabular_hidden_dim=model_config.tabular_hidden_dim,
-            norm_type=getattr(model_config, "norm_type", "batch"),
-            group_norm_groups=getattr(model_config, "group_norm_groups", 8),
         ).to(device)
 
         pos_weight = compute_pos_weight(fold_train, fold_train_config.pos_weight_strategy)

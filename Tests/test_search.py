@@ -265,5 +265,97 @@ class ConfigsFromParamsNewFieldsTest(unittest.TestCase):
         self.assertEqual(train_cfg.pos_weight_strategy, "ratio")
 
 
+class ConfigsFromParamsArchitectureTest(unittest.TestCase):
+    """Architecture field round-trips through _configs_from_params."""
+
+    def _base_params(self) -> dict:
+        return {
+            "target_edge": 64,
+            "bbox_margin": 8,
+            "nan_strategy": "none",
+            "augmentations_enabled": False,
+            "flip_axes": "none",
+            "depth": 18,
+            "base_channels": 32,
+            "dropout": 0.2,
+            "learning_rate": 1e-3,
+            "weight_decay": 1e-4,
+            "optimizer_name": "adamw",
+            "scheduler_name": "cosine",
+            "batch_size": 8,
+            "epochs": 12,
+        }
+
+    def test_unet_architecture_is_reconstructed(self) -> None:
+        params = self._base_params()
+        params.update({
+            "architecture": "unet3d",
+            "unet_depth": 3,
+            "unet_base_channels": 16,
+            "unet_channel_multiplier": 2,
+        })
+        _, _, model_cfg, _ = _configs_from_params(
+            params, DataConfig(), AugmentationConfig(), ModelConfig(), TrainConfig(), Path("/tmp/test"),
+        )
+        self.assertEqual(model_cfg.architecture, "unet3d")
+        self.assertEqual(model_cfg.unet_depth, 3)
+        self.assertEqual(model_cfg.unet_base_channels, 16)
+        self.assertEqual(model_cfg.unet_channel_multiplier, 2)
+
+    def test_missing_architecture_defaults_to_resnet3d(self) -> None:
+        """Old param dicts (pre–U-Net integration) lack 'architecture'."""
+        params = self._base_params()  # no architecture key
+        _, _, model_cfg, _ = _configs_from_params(
+            params, DataConfig(), AugmentationConfig(), ModelConfig(), TrainConfig(), Path("/tmp/test"),
+        )
+        self.assertEqual(model_cfg.architecture, "resnet3d")
+        self.assertEqual(model_cfg.depth, 18)
+        self.assertEqual(model_cfg.base_channels, 32)
+
+    def test_pointnet_architecture_is_reconstructed(self) -> None:
+        params = self._base_params()
+        params.update({
+            "architecture": "pointnet",
+            "pointnet_num_points": 2048,
+            "pointnet_global_dim": 256,
+            "pointnet_mlp_variant": "large",
+            "pointnet_head_hidden_dim": 64,
+            "pointnet_point_features": 4,
+            "pointnet_use_input_transform": True,
+        })
+        _, _, model_cfg, _ = _configs_from_params(
+            params, DataConfig(), AugmentationConfig(), ModelConfig(), TrainConfig(), Path("/tmp/test"),
+        )
+        self.assertEqual(model_cfg.architecture, "pointnet")
+        self.assertEqual(model_cfg.pointnet_num_points, 2048)
+        self.assertEqual(model_cfg.pointnet_global_dim, 256)
+        self.assertEqual(model_cfg.pointnet_mlp_channels, (64, 128, 256, 512))
+        self.assertEqual(model_cfg.pointnet_head_hidden_dim, 64)
+        self.assertEqual(model_cfg.pointnet_point_features, 4)
+        self.assertTrue(model_cfg.pointnet_use_input_transform)
+
+    def test_pointnet_missing_params_use_base_defaults(self) -> None:
+        params = self._base_params()
+        params.update({"architecture": "pointnet"})  # no pointnet_* keys
+        base = ModelConfig(
+            pointnet_num_points=777,
+            pointnet_global_dim=333,
+            pointnet_mlp_channels=(8, 16),
+            pointnet_head_hidden_dim=11,
+            pointnet_point_features=3,
+            pointnet_use_input_transform=False,
+        )
+        _, _, model_cfg, _ = _configs_from_params(
+            params, DataConfig(), AugmentationConfig(), base, TrainConfig(), Path("/tmp/test"),
+        )
+        self.assertEqual(model_cfg.architecture, "pointnet")
+        self.assertEqual(model_cfg.pointnet_num_points, 777)
+        self.assertEqual(model_cfg.pointnet_global_dim, 333)
+        self.assertEqual(model_cfg.pointnet_mlp_channels, (8, 16))
+        self.assertEqual(model_cfg.pointnet_head_hidden_dim, 11)
+        self.assertEqual(model_cfg.pointnet_point_features, 3)
+        self.assertFalse(model_cfg.pointnet_use_input_transform)
+
+
 if __name__ == "__main__":
     unittest.main()

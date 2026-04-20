@@ -29,7 +29,7 @@ from Model.engine import (
     resolve_device,
     save_json,
 )
-from Model.resnet3d import build_resnet3d
+from Model.factory import build_model
 from Utils.calibration import apply_temperature, logits_from_probs
 from Utils.config import AugmentationConfig, DataConfig, ModelConfig, TrainConfig
 from Utils.metrics import bootstrap_confidence_intervals, compute_binary_classification_metrics, optimize_threshold
@@ -64,6 +64,9 @@ def _reconstruct_configs(meta: dict) -> tuple[DataConfig, AugmentationConfig, Mo
     aug_config = AugmentationConfig(enabled=False)  # inference-only
 
     model_config = ModelConfig(
+        # Older checkpoints predating U-Net integration lack "architecture";
+        # default to ResNet3D so those runs keep reloading cleanly.
+        architecture=model_raw.get("architecture", "resnet3d"),
         depth=model_raw.get("depth", 18),
         in_channels=model_raw.get("in_channels", 1),
         base_channels=model_raw.get("base_channels", 32),
@@ -73,6 +76,17 @@ def _reconstruct_configs(meta: dict) -> tuple[DataConfig, AugmentationConfig, Mo
         tabular_hidden_dim=model_raw.get("tabular_hidden_dim", 16),
         norm_type=model_raw.get("norm_type", "batch"),
         group_norm_groups=model_raw.get("group_norm_groups", 8),
+        unet_depth=model_raw.get("unet_depth", 4),
+        unet_base_channels=model_raw.get("unet_base_channels", 16),
+        unet_channel_multiplier=model_raw.get("unet_channel_multiplier", 2),
+        unet_bottleneck_channels=model_raw.get("unet_bottleneck_channels", None),
+        pointnet_num_points=model_raw.get("pointnet_num_points", 1024),
+        pointnet_point_features=model_raw.get("pointnet_point_features", 3),
+        pointnet_mlp_channels=tuple(model_raw.get("pointnet_mlp_channels", (64, 128, 256))),
+        pointnet_global_dim=model_raw.get("pointnet_global_dim", 512),
+        pointnet_head_hidden_dim=model_raw.get("pointnet_head_hidden_dim", 128),
+        pointnet_binary_threshold=model_raw.get("pointnet_binary_threshold", 0.5),
+        pointnet_use_input_transform=model_raw.get("pointnet_use_input_transform", False),
     )
 
     train_config = TrainConfig(
@@ -100,16 +114,9 @@ def _run_trial_inference(trial_dir: Path, device: torch.device) -> dict:
     )
     tabular_stats = checkpoint_meta.get("tabular_feature_stats")
 
-    model = build_resnet3d(
-        depth=model_cfg.depth,
-        in_channels=model_cfg.in_channels,
-        base_channels=model_cfg.base_channels,
-        dropout=model_cfg.dropout,
-        num_classes=model_cfg.num_classes,
+    model = build_model(
+        model_config=model_cfg,
         num_tabular_features=len(TABULAR_FEATURE_NAMES) if model_cfg.use_tabular_features else 0,
-        tabular_hidden_dim=model_cfg.tabular_hidden_dim,
-        norm_type=model_cfg.norm_type,
-        group_norm_groups=model_cfg.group_norm_groups,
     ).to(device)
     checkpoint = torch.load(trial_dir / "best_model.pt", map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])

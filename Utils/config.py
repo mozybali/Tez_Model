@@ -78,6 +78,7 @@ class AugmentationConfig:
 
 @dataclass(slots=True)
 class ModelConfig:
+    architecture: str = "resnet3d"  # "resnet3d", "unet3d" or "pointnet"
     depth: int = 18
     in_channels: int = 1
     base_channels: int = 32
@@ -87,6 +88,19 @@ class ModelConfig:
     tabular_hidden_dim: int = 16
     norm_type: str = "batch"  # "batch" or "group" — group helps when batch_size is small.
     group_norm_groups: int = 8
+    # U-Net–specific fields (ignored when architecture == "resnet3d")
+    unet_depth: int = 4
+    unet_base_channels: int = 16
+    unet_channel_multiplier: int = 2
+    unet_bottleneck_channels: int | None = None
+    # PointNet-specific fields (ignored when architecture != "pointnet")
+    pointnet_num_points: int = 1024
+    pointnet_point_features: int = 3
+    pointnet_mlp_channels: tuple[int, ...] = (64, 128, 256)
+    pointnet_global_dim: int = 512
+    pointnet_head_hidden_dim: int = 128
+    pointnet_binary_threshold: float = 0.5
+    pointnet_use_input_transform: bool = False
 
 
 @dataclass(slots=True)

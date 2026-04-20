@@ -17,6 +17,9 @@ TezModel/
 │   └── transforms.py         # 3B flip, affine ve morfolojik augmentasyonlar
 ├── Model/
 │   ├── resnet3d.py           # PyTorch ile ResNet3D-18 / ResNet3D-34
+│   ├── unet3d.py             # 3B U-Net tabanlı sınıflandırıcı (ikili anomali etiketi)
+│   ├── pointnet.py           # 3B maskelerden türetilen point cloud üzerinde çalışan PointNet
+│   ├── factory.py            # architecture alanına göre model kuran ortak fabrika
 │   ├── engine.py             # Eğitim, doğrulama, test, kalibrasyon ve TTA akışı
 │   ├── train.py              # Tek eğitim çalıştırması için CLI
 │   ├── search.py             # Optuna ile hiperparametre araması
@@ -57,19 +60,32 @@ Splitler `ZS-train`, `ZS-dev` ve `ZS-test` olarak tanımlıdır. Metadata üreti
 
 Komutları proje kök dizininden çalıştırın.
 
+Unix benzeri kabuklar için:
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+Windows PowerShell için:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
 Temel gereksinimler:
 
 - Python 3.10 veya üzeri
-- PyTorch 2.0 veya üzeri
+- PyTorch 2.0 veya üzeri (CUDA wheel kurulumu `requirements.txt` içinde korunur)
 - NumPy 1.24 veya üzeri
 - scikit-learn 1.0 veya üzeri
 - Optuna 3.0 veya üzeri
+- matplotlib, pytest
+
+PointNet mimarisi saf PyTorch ile uygulanmıştır; PyTorch Geometric, torch-scatter veya torch-cluster gibi nokta bulutuna özgü kütüphaneler gerekmez. Bu nedenle `requirements.txt` değişmeden kalır.
 
 ## Hızlı Başlangıç
 
@@ -129,7 +145,63 @@ Varsayılan hedef boyut `64 x 64 x 64` olarak ayarlanmıştır. Sağ böbreği k
 
 ## Model
 
-Model, saf PyTorch ile yazılmış ResNet3D mimarisini kullanır. `--depth 18` ve `--depth 34` seçenekleri desteklenir. Ana giriş `1 x D x H x W` şekilli 3B ROI maskesidir.
+Proje üç farklı 3B omurga mimarisini destekler ve `--architecture` argümanı ile seçilir:
+
+- `resnet3d` (varsayılan): Saf PyTorch ile yazılmış ResNet3D. `--depth 18` ve `--depth 34` desteklenir.
+- `unet3d`: Sınıflandırma için uyarlanmış hafif bir 3B U-Net. Encoder-decoder ve skip bağlantılarından sonra global pooling ve küçük bir sınıflandırıcı başlığı kullanır; çıktı segmentasyon maskesi değil, logit değeridir.
+- `pointnet`: İkili 3B ROI maskesinden foreground voxellerin koordinatlarını çıkartarak sabit boyutlu bir point cloud oluşturur, koordinatları yaklaşık `[-1, 1]` aralığına normalize eder ve shared MLP + global max-pooling ile sınıflandırma logiti üretir. Eğitimde replacement ile rastgele örnekleme, değerlendirmede deterministik örnekleme kullanılır; boş maskeler güvenli bir şekilde sıfır noktalara düşürülür. Uygulama saf PyTorch'tur; PyTorch Geometric, torch-scatter veya torch-cluster gibi ek bağımlılıklar gerektirmez.
+
+Ana giriş her üç mimaride de `1 x D x H x W` şekilli 3B ROI maskesidir ve çıktı `BCEWithLogitsLoss` ile uyumlu `(B,)` şekilli logit vektörüdür.
+
+U-Net seçildiğinde ek CLI argümanları kullanılabilir:
+
+| Parametre | Varsayılan | Açıklama |
+|---|---:|---|
+| `--unet-depth` | `4` | Encoder seviyesi sayısı |
+| `--unet-base-channels` | `16` | İlk seviyedeki kanal sayısı |
+| `--unet-channel-multiplier` | `2` | Her seviye arasındaki kanal çarpanı |
+| `--unet-bottleneck-channels` | `None` | Dar boğaz kanal sayısını açıkça belirlemek için opsiyonel |
+
+Örnek U-Net eğitimi:
+
+```bash
+python -m Model.train \
+  --architecture unet3d \
+  --unet-depth 4 \
+  --unet-base-channels 16 \
+  --unet-channel-multiplier 2 \
+  --epochs 20 \
+  --batch-size 8 \
+  --target-shape 64 64 64 \
+  --output-dir outputs/unet3d_baseline
+```
+
+PointNet seçildiğinde ek CLI argümanları kullanılabilir:
+
+| Parametre | Varsayılan | Açıklama |
+|---|---:|---|
+| `--pointnet-num-points` | `1024` | Her örnek için sabit örneklenen foreground voxel sayısı |
+| `--pointnet-point-features` | `3` | `3` yalnızca xyz, `4` ek bir occupancy kanalı ekler |
+| `--pointnet-mlp-channels` | `64 128 256` | Global pooling öncesi shared-MLP kanal zinciri |
+| `--pointnet-global-dim` | `512` | Max-pool sonrası global öznitelik boyutu |
+| `--pointnet-head-hidden-dim` | `128` | Sınıflandırıcı MLP'nin gizli boyutu (`0` → tek doğrusal katman) |
+| `--pointnet-binary-threshold` | `0.5` | Maske değerini foreground voxel olarak sayan eşik |
+| `--pointnet-use-input-transform` | kapalı | Birim matrise initialize edilmiş küçük bir T-Net'i xyz üzerinde uygular |
+
+Örnek PointNet eğitimi:
+
+```bash
+python -m Model.train \
+  --architecture pointnet \
+  --pointnet-num-points 1024 \
+  --pointnet-mlp-channels 64 128 256 \
+  --pointnet-global-dim 512 \
+  --pointnet-head-hidden-dim 128 \
+  --epochs 20 \
+  --batch-size 8 \
+  --target-shape 64 64 64 \
+  --output-dir outputs/pointnet_baseline
+```
 
 Varsayılan olarak modele iki ek tabular özellik de verilir:
 
@@ -211,7 +283,17 @@ python -m Model.search \
 
 `--epochs`, her trial için maksimum epoch bütçesidir; arama sırasında bu bütçenin daha kısa alt değerleri de denenebilir. `--final-epochs` verilirse en iyi trial parametreleriyle `best_run/` altında bu epoch sayısıyla yeniden eğitim yapılır. Verilmezse en iyi trial'ın epoch bütçesi kullanılır.
 
-Arama uzayı learning rate, weight decay, optimizer, scheduler, batch size, epoch bütçesi, early stopping patience, gradient clipping, eşik seçimi stratejisi (`youden` / `f1` / `fbeta`) ve F-beta değeri, kalibrasyon yöntemi (`temperature` / `isotonic` / `temperature+isotonic`), flip tabanlı TTA, AMP, weighted sampler, ResNet derinliği, kanal sayısı, dropout, tabular özellik kullanımı, hedef hacim boyutu, bounding box crop, cube padding, sağ böbrek kanonikleştirme, NaN stratejisi ve augmentasyon parametrelerini kapsar.
+Arama uzayı mimari seçimini (`resnet3d` / `unet3d` / `pointnet`), learning rate, weight decay, optimizer, scheduler, batch size, epoch bütçesi, early stopping patience, gradient clipping, eşik seçimi stratejisi (`youden` / `f1` / `fbeta`) ve F-beta değeri, kalibrasyon yöntemi (`temperature` / `isotonic` / `temperature+isotonic`), flip tabanlı TTA, AMP, weighted sampler, ResNet derinliği ve kanal sayısı, U-Net derinliği / base channel / kanal çarpanı, PointNet için `pointnet_num_points` ∈ {512, 1024, 2048, 4096}, global dim, MLP varyantı (`small` / `medium` / `large`), sınıflandırıcı head boyutu, nokta özellik sayısı ve opsiyonel input transform, dropout, tabular özellik kullanımı, hedef hacim boyutu, bounding box crop, cube padding, sağ böbrek kanonikleştirme, NaN stratejisi ve augmentasyon parametrelerini kapsar. Mimariye özgü hiperparametreler yalnızca ilgili mimari seçildiğinde örneklenir; eski (mimari alanı içermeyen) trial parametreleri geriye dönük olarak ResNet3D varsayımıyla yeniden kurulur, PointNet-özgü alanları eksik trial'lar ise PointNet için güvenli varsayılanlara düşer.
+
+Arama uzayında PointNet'i de içeren örnek komut:
+
+```bash
+python -m Model.search \
+  --n-trials 30 \
+  --epochs 12 \
+  --device auto \
+  --output-dir outputs/optuna_with_pointnet
+```
 
 Optuna çıktıları:
 
@@ -234,7 +316,7 @@ python -m Model.ensemble \
   --top-k 5
 ```
 
-`Model.ensemble`, `leaderboard.json` üzerinden en iyi K trial'ı seçer, her trial'ın `best_model.pt` ve `checkpoint_meta.json` dosyalarından konfigürasyonu yeniden kurar, test splitinde kalibre probabiliteleri ortalar ve bootstrap güven aralıklarıyla birlikte ensemble metriklerini raporlar.
+`Model.ensemble`, `leaderboard.json` üzerinden en iyi K trial'ı seçer, her trial'ın `best_model.pt` ve `checkpoint_meta.json` dosyalarından konfigürasyonu yeniden kurar (ResNet3D, U-Net3D ve PointNet trial'ları karışık olsa bile her bir trial doğru mimaride yeniden oluşturulur), test splitinde kalibre probabiliteleri ortalar ve bootstrap güven aralıklarıyla birlikte ensemble metriklerini raporlar.
 
 ## Kalibrasyon ve Eşik Seçimi
 

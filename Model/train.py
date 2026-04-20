@@ -23,9 +23,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--optimizer", choices=["adam", "adamw", "sgd"], default="adamw")
     parser.add_argument("--sgd-momentum", type=float, default=0.9)
     parser.add_argument("--scheduler", choices=["cosine", "none"], default="cosine")
+    parser.add_argument("--architecture", choices=["resnet3d", "unet3d", "pointnet"], default="resnet3d",
+                        help="Backbone architecture: ResNet3D, 3D U-Net classifier, or PointNet.")
     parser.add_argument("--depth", choices=[18, 34], type=int, default=18)
     parser.add_argument("--base-channels", type=int, default=32)
     parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument("--unet-depth", type=int, default=4,
+                        help="Number of encoder levels for the 3D U-Net classifier.")
+    parser.add_argument("--unet-base-channels", type=int, default=16,
+                        help="Base channel count for the 3D U-Net encoder.")
+    parser.add_argument("--unet-channel-multiplier", type=int, default=2,
+                        help="Per-level channel multiplier for the 3D U-Net.")
+    parser.add_argument("--unet-bottleneck-channels", type=int, default=None,
+                        help="Optional explicit bottleneck channels for the 3D U-Net.")
+    parser.add_argument("--pointnet-num-points", type=int, default=1024,
+                        help="Number of foreground voxels sampled per sample for PointNet.")
+    parser.add_argument("--pointnet-point-features", type=int, choices=[3, 4], default=3,
+                        help="3 for xyz only, 4 to also append an occupancy feature.")
+    parser.add_argument("--pointnet-mlp-channels", nargs="+", type=int, default=(64, 128, 256),
+                        help="Shared-MLP channel progression before the global pooling stage.")
+    parser.add_argument("--pointnet-global-dim", type=int, default=512,
+                        help="Global feature dimension fed into the classifier head.")
+    parser.add_argument("--pointnet-head-hidden-dim", type=int, default=128,
+                        help="Hidden dim of the classifier MLP; pass 0 for a single linear layer.")
+    parser.add_argument("--pointnet-binary-threshold", type=float, default=0.5,
+                        help="Threshold for converting mask values to foreground voxels.")
+    parser.add_argument("--pointnet-use-input-transform", action="store_true",
+                        help="Enable a small identity-init T-Net on xyz coordinates.")
     parser.add_argument("--disable-tabular-features", action="store_true")
     parser.add_argument("--tabular-hidden-dim", type=int, default=16)
     parser.add_argument("--target-shape", nargs=3, type=int, default=(64, 64, 64))
@@ -118,6 +142,7 @@ def main() -> None:
         morphology_probability=args.morphology_probability,
     )
     model_config = ModelConfig(
+        architecture=args.architecture,
         depth=args.depth,
         base_channels=args.base_channels,
         dropout=args.dropout,
@@ -125,6 +150,17 @@ def main() -> None:
         tabular_hidden_dim=args.tabular_hidden_dim,
         norm_type=args.norm_type,
         group_norm_groups=args.group_norm_groups,
+        unet_depth=args.unet_depth,
+        unet_base_channels=args.unet_base_channels,
+        unet_channel_multiplier=args.unet_channel_multiplier,
+        unet_bottleneck_channels=args.unet_bottleneck_channels,
+        pointnet_num_points=args.pointnet_num_points,
+        pointnet_point_features=args.pointnet_point_features,
+        pointnet_mlp_channels=tuple(args.pointnet_mlp_channels),
+        pointnet_global_dim=args.pointnet_global_dim,
+        pointnet_head_hidden_dim=args.pointnet_head_hidden_dim,
+        pointnet_binary_threshold=args.pointnet_binary_threshold,
+        pointnet_use_input_transform=args.pointnet_use_input_transform,
     )
     train_config = TrainConfig(
         output_dir=args.output_dir,

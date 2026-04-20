@@ -173,10 +173,67 @@ def _sample_trial_configs(
     else:
         aug_config = replace(base_aug, enabled=False)
 
+    architecture = trial.suggest_categorical("architecture", ["resnet3d", "unet3d", "pointnet"])
+    depth = base_model.depth
+    base_channels_val = base_model.base_channels
+    unet_depth = base_model.unet_depth
+    unet_base_channels = base_model.unet_base_channels
+    unet_channel_multiplier = base_model.unet_channel_multiplier
+    unet_bottleneck_channels = base_model.unet_bottleneck_channels
+    pointnet_num_points = base_model.pointnet_num_points
+    pointnet_global_dim = base_model.pointnet_global_dim
+    pointnet_mlp_channels = base_model.pointnet_mlp_channels
+    pointnet_head_hidden_dim = base_model.pointnet_head_hidden_dim
+    pointnet_point_features = base_model.pointnet_point_features
+    pointnet_use_input_transform = base_model.pointnet_use_input_transform
+    pointnet_binary_threshold = base_model.pointnet_binary_threshold
+
+    if architecture == "resnet3d":
+        depth = trial.suggest_categorical("depth", [18, 34])
+        base_channels_val = trial.suggest_categorical("base_channels", [16, 24, 32])
+    elif architecture == "unet3d":
+        # Keep memory usage conservative — volumes can be 80^3, so cap U-Net size.
+        unet_depth = trial.suggest_categorical("unet_depth", [3, 4])
+        unet_base_channels = trial.suggest_categorical("unet_base_channels", [8, 16, 24, 32])
+        unet_channel_multiplier = trial.suggest_categorical("unet_channel_multiplier", [2, 3])
+        unet_bottleneck_choice = trial.suggest_categorical(
+            "unet_bottleneck_choice", ["auto", "64", "128", "256"]
+        )
+        unet_bottleneck_channels = (
+            None if unet_bottleneck_choice == "auto" else int(unet_bottleneck_choice)
+        )
+    else:  # pointnet — conservative memory use on small-batch GPUs
+        pointnet_num_points = trial.suggest_categorical(
+            "pointnet_num_points", [512, 1024, 2048, 4096]
+        )
+        pointnet_global_dim = trial.suggest_categorical(
+            "pointnet_global_dim", [256, 512, 1024]
+        )
+        pointnet_mlp_variant = trial.suggest_categorical(
+            "pointnet_mlp_variant", ["small", "medium", "large"]
+        )
+        pointnet_mlp_channels = {
+            "small": (64, 128),
+            "medium": (64, 128, 256),
+            "large": (64, 128, 256, 512),
+        }[pointnet_mlp_variant]
+        pointnet_head_hidden_dim = trial.suggest_categorical(
+            "pointnet_head_hidden_dim", [0, 64, 128, 256]
+        )
+        pointnet_point_features = trial.suggest_categorical(
+            "pointnet_point_features", [3, 4]
+        )
+        pointnet_use_input_transform = trial.suggest_categorical(
+            "pointnet_use_input_transform", [False, True]
+        )
+        pointnet_binary_threshold = trial.suggest_categorical(
+            "pointnet_binary_threshold", [0.3, 0.5, 0.7]
+        )
     model_config = replace(
         base_model,
-        depth=trial.suggest_categorical("depth", [18, 34]),
-        base_channels=trial.suggest_categorical("base_channels", [16, 24, 32]),
+        architecture=architecture,
+        depth=depth,
+        base_channels=base_channels_val,
         dropout=trial.suggest_float("dropout", 0.0, 0.4),
         use_tabular_features=use_tabular_features,
         tabular_hidden_dim=(
@@ -184,8 +241,23 @@ def _sample_trial_configs(
             if use_tabular_features
             else base_model.tabular_hidden_dim
         ),
-        norm_type=trial.suggest_categorical("norm_type", ["batch", "group"]),
-        group_norm_groups=base_model.group_norm_groups,
+        norm_type=(norm_type := trial.suggest_categorical("norm_type", ["batch", "group"])),
+        group_norm_groups=(
+            trial.suggest_categorical("group_norm_groups", [4, 8, 16])
+            if norm_type == "group"
+            else base_model.group_norm_groups
+        ),
+        unet_depth=unet_depth,
+        unet_base_channels=unet_base_channels,
+        unet_channel_multiplier=unet_channel_multiplier,
+        unet_bottleneck_channels=unet_bottleneck_channels,
+        pointnet_num_points=pointnet_num_points,
+        pointnet_point_features=pointnet_point_features,
+        pointnet_mlp_channels=pointnet_mlp_channels,
+        pointnet_global_dim=pointnet_global_dim,
+        pointnet_head_hidden_dim=pointnet_head_hidden_dim,
+        pointnet_binary_threshold=pointnet_binary_threshold,
+        pointnet_use_input_transform=pointnet_use_input_transform,
     )
 
     optimizer_name = trial.suggest_categorical("optimizer_name", ["adam", "adamw", "sgd"])
@@ -293,15 +365,54 @@ def _configs_from_params(
         )
     else:
         aug_config = replace(base_aug, enabled=False)
+    # Missing "architecture" key means this trial was produced before the U-Net
+    # integration — fall back to ResNet3D for backward compatibility.
+    architecture = params.get("architecture", "resnet3d")
+    pointnet_mlp_variant = params.get("pointnet_mlp_variant")
+    pointnet_mlp_channels = {
+        "small": (64, 128),
+        "medium": (64, 128, 256),
+        "large": (64, 128, 256, 512),
+    }.get(pointnet_mlp_variant, tuple(base_model.pointnet_mlp_channels))
     model_config = replace(
         base_model,
-        depth=params["depth"],
-        base_channels=params["base_channels"],
+        architecture=architecture,
+        depth=params.get("depth", base_model.depth),
+        base_channels=params.get("base_channels", base_model.base_channels),
         dropout=params["dropout"],
         use_tabular_features=params.get("use_tabular_features", base_model.use_tabular_features),
         tabular_hidden_dim=params.get("tabular_hidden_dim", base_model.tabular_hidden_dim),
         norm_type=params.get("norm_type", base_model.norm_type),
         group_norm_groups=params.get("group_norm_groups", base_model.group_norm_groups),
+        unet_depth=params.get("unet_depth", base_model.unet_depth),
+        unet_base_channels=params.get("unet_base_channels", base_model.unet_base_channels),
+        unet_channel_multiplier=params.get(
+            "unet_channel_multiplier", base_model.unet_channel_multiplier
+        ),
+        unet_bottleneck_channels=(
+            None
+            if params.get("unet_bottleneck_choice") == "auto"
+            else (
+                int(params["unet_bottleneck_choice"])
+                if "unet_bottleneck_choice" in params
+                else params.get("unet_bottleneck_channels", base_model.unet_bottleneck_channels)
+            )
+        ),
+        pointnet_num_points=params.get("pointnet_num_points", base_model.pointnet_num_points),
+        pointnet_point_features=params.get(
+            "pointnet_point_features", base_model.pointnet_point_features
+        ),
+        pointnet_mlp_channels=pointnet_mlp_channels,
+        pointnet_global_dim=params.get("pointnet_global_dim", base_model.pointnet_global_dim),
+        pointnet_head_hidden_dim=params.get(
+            "pointnet_head_hidden_dim", base_model.pointnet_head_hidden_dim
+        ),
+        pointnet_binary_threshold=params.get(
+            "pointnet_binary_threshold", base_model.pointnet_binary_threshold
+        ),
+        pointnet_use_input_transform=params.get(
+            "pointnet_use_input_transform", base_model.pointnet_use_input_transform
+        ),
     )
     train_config = replace(
         base_train,
