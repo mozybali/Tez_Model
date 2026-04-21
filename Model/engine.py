@@ -187,6 +187,7 @@ def build_dataloaders(
         train_sampler = _build_weighted_sampler(train_labels, seed=train_config.seed)
         train_shuffle = False
 
+    persistent = train_config.num_workers > 0
     dataloaders = {
         "train": DataLoader(
             datasets["train"],
@@ -195,6 +196,8 @@ def build_dataloaders(
             sampler=train_sampler,
             num_workers=train_config.num_workers,
             pin_memory=pin_memory,
+            persistent_workers=persistent,
+            prefetch_factor=2 if persistent else None,
             generator=generator if train_sampler is None else None,
         ),
         "val": DataLoader(
@@ -203,6 +206,8 @@ def build_dataloaders(
             shuffle=False,
             num_workers=train_config.num_workers,
             pin_memory=pin_memory,
+            persistent_workers=persistent,
+            prefetch_factor=2 if persistent else None,
         ),
         "test": DataLoader(
             datasets["test"],
@@ -210,6 +215,8 @@ def build_dataloaders(
             shuffle=False,
             num_workers=train_config.num_workers,
             pin_memory=pin_memory,
+            persistent_workers=persistent,
+            prefetch_factor=2 if persistent else None,
         ),
     }
     return dataloaders, splits
@@ -684,51 +691,68 @@ def run_training(
     test_metrics_fixed: dict[str, float] = {}
     test_ci: dict = {}
     test_payload: dict = {}
+    test_eval_error: str | None = None
 
     if not skip_test:
-        # Raw test predictions, then apply calibration for reported metrics.
-        test_preds = collect_predictions(
-            model, dataloaders["test"], device, tabular_feature_stats, tta_enabled=tta_enabled,
-        )
-        test_logits_np = np.asarray(
-            test_preds.get("y_logit") or logits_from_probs(np.asarray(test_preds["y_prob"]))
-        )
-        test_probs_after_temp = apply_temperature(test_logits_np, temperature)
-        if isotonic_result is not None:
-            test_probs_cal = apply_isotonic(test_probs_after_temp, isotonic_result)
-        else:
-            test_probs_cal = test_probs_after_temp
+        # Test eval can crash on Windows with OpenBLAS memory-allocation errors
+        # mid-bootstrap; guard the whole block so the trained checkpoint and
+        # calibration artifacts aren't lost when it does.
+        try:
+            # Raw test predictions, then apply calibration for reported metrics.
+            test_preds = collect_predictions(
+                model, dataloaders["test"], device, tabular_feature_stats, tta_enabled=tta_enabled,
+            )
+            test_logits_np = np.asarray(
+                test_preds.get("y_logit") or logits_from_probs(np.asarray(test_preds["y_prob"]))
+            )
+            test_probs_after_temp = apply_temperature(test_logits_np, temperature)
+            if isotonic_result is not None:
+                test_probs_cal = apply_isotonic(test_probs_after_temp, isotonic_result)
+            else:
+                test_probs_cal = test_probs_after_temp
 
-        # Compute loss on the test set (AMP off for numerical parity).
-        _, _, test_loss = _run_epoch_raw(
-            model=model, dataloader=dataloaders["test"], criterion=criterion,
-            optimizer=None, device=device, amp_enabled=False,
-            tabular_feature_stats=tabular_feature_stats,
-        )
+            # Compute loss on the test set (AMP off for numerical parity).
+            _, _, test_loss = _run_epoch_raw(
+                model=model, dataloader=dataloaders["test"], criterion=criterion,
+                optimizer=None, device=device, amp_enabled=False,
+                tabular_feature_stats=tabular_feature_stats,
+            )
 
-        test_metrics_fixed = compute_binary_classification_metrics(
-            test_preds["y_true"], test_probs_cal.tolist(), threshold=fixed_threshold,
-        )
-        test_metrics_fixed["loss"] = test_loss
-        test_metrics = compute_binary_classification_metrics(
-            test_preds["y_true"], test_probs_cal.tolist(), threshold=optimal_threshold,
-        )
-        test_metrics["loss"] = test_loss
+            test_metrics_fixed = compute_binary_classification_metrics(
+                test_preds["y_true"], test_probs_cal.tolist(), threshold=fixed_threshold,
+            )
+            test_metrics_fixed["loss"] = test_loss
+            test_metrics = compute_binary_classification_metrics(
+                test_preds["y_true"], test_probs_cal.tolist(), threshold=optimal_threshold,
+            )
+            test_metrics["loss"] = test_loss
 
-        test_ci = bootstrap_confidence_intervals(
-            test_preds["y_true"], test_probs_cal.tolist(),
-            threshold=optimal_threshold, seed=train_config.seed,
-        )
-        test_payload = {
-            "y_true": test_preds["y_true"],
-            "y_prob_uncalibrated": test_preds["y_prob"],
-            "y_prob_calibrated": test_probs_cal.tolist(),
-            "temperature": temperature,
-            "fixed_threshold": fixed_threshold,
-            "tuned_threshold": optimal_threshold,
-            "ece_uncalibrated": expected_calibration_error(test_preds["y_prob"], test_preds["y_true"]),
-            "ece_calibrated": expected_calibration_error(test_probs_cal.tolist(), test_preds["y_true"]),
-        }
+            test_payload = {
+                "y_true": test_preds["y_true"],
+                "y_prob_uncalibrated": test_preds["y_prob"],
+                "y_prob_calibrated": test_probs_cal.tolist(),
+                "temperature": temperature,
+                "fixed_threshold": fixed_threshold,
+                "tuned_threshold": optimal_threshold,
+                "ece_uncalibrated": expected_calibration_error(test_preds["y_prob"], test_preds["y_true"]),
+                "ece_calibrated": expected_calibration_error(test_probs_cal.tolist(), test_preds["y_true"]),
+            }
+
+            # Bootstrap CI is the most BLAS-allocation-heavy step; isolate it so
+            # a crash here still leaves us with the point-estimate test metrics.
+            try:
+                test_ci = bootstrap_confidence_intervals(
+                    test_preds["y_true"], test_probs_cal.tolist(),
+                    threshold=optimal_threshold, seed=train_config.seed,
+                )
+            except Exception as exc:
+                test_eval_error = f"bootstrap_ci_failed: {type(exc).__name__}: {exc}"
+                if not quiet:
+                    print(f"  Warning: bootstrap CI failed ({exc}); continuing without it.")
+        except Exception as exc:
+            test_eval_error = f"test_eval_failed: {type(exc).__name__}: {exc}"
+            if not quiet:
+                print(f"  Warning: test evaluation failed ({exc}); saving training artifacts only.")
 
     config_payload = {
         "data": to_serializable(data_config),
@@ -741,6 +765,7 @@ def run_training(
         "temperature": temperature,
         "tabular_feature_names": list(TABULAR_FEATURE_NAMES) if model_config.use_tabular_features else [],
         "tabular_feature_stats": tabular_feature_stats,
+        "test_eval_error": test_eval_error,
     }
     save_json(config_payload, output_dir / "config.json")
     save_json({"history": history}, output_dir / "history.json")
@@ -786,6 +811,7 @@ def run_training(
         "fixed_threshold": fixed_threshold,
         "temperature": temperature,
         "checkpoint_path": str(best_checkpoint),
+        "test_eval_error": test_eval_error,
     }
 
 
@@ -886,15 +912,20 @@ def run_cross_validation(
             )
             fold_shuffle = False
 
+        fold_persistent = fold_train_config.num_workers > 0
         dataloaders = {
             "train": DataLoader(
                 datasets["train"], batch_size=fold_train_config.batch_size,
                 shuffle=fold_shuffle, sampler=fold_sampler,
                 num_workers=fold_train_config.num_workers, pin_memory=pin_memory,
+                persistent_workers=fold_persistent,
+                prefetch_factor=2 if fold_persistent else None,
                 generator=generator if fold_sampler is None else None,
             ),
             "val": DataLoader(datasets["val"], batch_size=fold_train_config.batch_size, shuffle=False,
-                              num_workers=fold_train_config.num_workers, pin_memory=pin_memory),
+                              num_workers=fold_train_config.num_workers, pin_memory=pin_memory,
+                              persistent_workers=fold_persistent,
+                              prefetch_factor=2 if fold_persistent else None),
         }
 
         tabular_feature_stats = (

@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+import os
+
+# Cap BLAS thread pools before numpy/torch are imported. Windows OpenBLAS can
+# raise "Memory allocation still failed after 10 retries" under bursts of
+# many short-lived BLAS calls (bootstrap CI + sklearn metrics); a single
+# thread avoids the contention without measurably slowing down our sizes.
+for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
 import argparse
 import json
 import math
@@ -175,7 +184,7 @@ def _sample_trial_configs(
     else:
         aug_config = replace(base_aug, enabled=False)
 
-    architecture = trial.suggest_categorical("architecture", ["resnet3d", "unet3d", "pointnet"])
+    architecture = "resnet3d"
     depth = base_model.depth
     base_channels_val = base_model.base_channels
     unet_depth = base_model.unet_depth
@@ -305,7 +314,7 @@ def _sample_trial_configs(
         ),
         loss_type=loss_type,
         focal_gamma=focal_gamma,
-        batch_size=trial.suggest_categorical("batch_size", [4, 8, 16]),
+        batch_size=trial.suggest_categorical("batch_size", [8, 16, 24, 32]),
         early_stopping_patience=trial.suggest_categorical(
             "early_stopping_patience",
             _patience_choices(base_train.epochs),

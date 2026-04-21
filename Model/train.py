@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+import os
+
+# Cap BLAS thread pools before numpy/torch are imported. Windows OpenBLAS can
+# raise "Memory allocation still failed after 10 retries" under bursts of
+# many short-lived BLAS calls (bootstrap CI + sklearn metrics); a single
+# thread avoids the contention without measurably slowing down our sizes.
+for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
 import argparse
 import json
 from pathlib import Path
