@@ -524,7 +524,7 @@ def run_training(
         if scheduler is not None:
             scheduler.step()
 
-        improved = score > best_score
+        improved = score > best_score + train_config.early_stopping_min_delta
         if improved:
             best_score = score
             best_epoch = epoch
@@ -552,7 +552,7 @@ def run_training(
                 },
                 output_dir / "checkpoint_meta.json",
             )
-        else:
+        elif epoch > train_config.warmup_epochs:
             patience_counter += 1
 
         if not quiet:
@@ -937,13 +937,13 @@ def run_cross_validation(
             if scheduler is not None:
                 scheduler.step()
 
-            if score > best_score:
+            if score > best_score + fold_train_config.early_stopping_min_delta:
                 best_score = score
                 best_epoch = epoch
                 best_val_metrics = val_metrics
                 patience_counter = 0
                 torch.save({"model_state_dict": model.state_dict()}, best_checkpoint)
-            else:
+            elif epoch > fold_train_config.warmup_epochs:
                 patience_counter += 1
 
             if patience_counter >= fold_train_config.early_stopping_patience:

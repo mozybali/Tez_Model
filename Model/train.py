@@ -57,6 +57,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4,
+                        help="Minimum score improvement to reset patience counter.")
     parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
     parser.add_argument("--decision-threshold", type=float, default=0.5)
     parser.add_argument("--norm-type", choices=["batch", "group"], default="batch",
@@ -175,6 +177,7 @@ def main() -> None:
         device=args.device,
         seed=args.seed,
         early_stopping_patience=args.patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
         gradient_clip_norm=args.gradient_clip_norm,
         decision_threshold=args.decision_threshold,
         primary_metric=args.primary_metric,

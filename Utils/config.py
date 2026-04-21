@@ -118,6 +118,7 @@ class TrainConfig:
     device: str = "auto"
     seed: int = 42
     early_stopping_patience: int = 10
+    early_stopping_min_delta: float = 1e-4
     gradient_clip_norm: float | None = 1.0
     decision_threshold: float = 0.5
     primary_metric: str = "pr_auc"
