@@ -95,6 +95,14 @@ def parse_args() -> argparse.Namespace:
         help="Maximum per-trial epoch budget; Optuna samples shorter budgets up to this value.",
     )
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--batch-size-choices",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Optuna batch_size search space. If omitted, defaults to [8,16,24,32]. "
+             "Pass a single value (e.g. --batch-size-choices 48) to fix batch size.",
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
@@ -127,6 +135,7 @@ def _sample_trial_configs(
     base_model: ModelConfig,
     base_train: TrainConfig,
     output_dir: Path,
+    batch_size_choices: list[int] | None = None,
 ) -> tuple[DataConfig, AugmentationConfig, ModelConfig, TrainConfig]:
     target_edge = trial.suggest_categorical("target_edge", [48, 64, 80])
     flip_axes_choice = trial.suggest_categorical("flip_axes", list(_FLIP_AXIS_CHOICES))
@@ -295,7 +304,7 @@ def _sample_trial_configs(
         "threshold_selection", ["youden", "f1", "fbeta"],
     )
     threshold_fbeta = (
-        trial.suggest_float("threshold_fbeta", 1.0, 2.0)
+        trial.suggest_float("threshold_fbeta", 1.0, 3.0)
         if threshold_selection == "fbeta"
         else base_train.threshold_fbeta
     )
@@ -314,7 +323,14 @@ def _sample_trial_configs(
         ),
         loss_type=loss_type,
         focal_gamma=focal_gamma,
-        batch_size=trial.suggest_categorical("batch_size", [8, 16, 24, 32]),
+        batch_size=(
+            batch_size_choices[0]
+            if batch_size_choices and len(batch_size_choices) == 1
+            else trial.suggest_categorical(
+                "batch_size",
+                batch_size_choices if batch_size_choices else [8, 16, 24, 32],
+            )
+        ),
         early_stopping_patience=trial.suggest_categorical(
             "early_stopping_patience",
             _patience_choices(base_train.epochs),
@@ -438,7 +454,7 @@ def _configs_from_params(
         pos_weight_strategy=params.get("pos_weight_strategy", base_train.pos_weight_strategy),
         loss_type=params.get("loss_type", base_train.loss_type),
         focal_gamma=params.get("focal_gamma", base_train.focal_gamma),
-        batch_size=params["batch_size"],
+        batch_size=params.get("batch_size", base_train.batch_size),
         early_stopping_patience=params.get("early_stopping_patience", base_train.early_stopping_patience),
         gradient_clip_norm=params.get("gradient_clip_norm", base_train.gradient_clip_norm),
         use_weighted_sampler=params.get("use_weighted_sampler", base_train.use_weighted_sampler),
@@ -528,6 +544,7 @@ def main() -> None:
             base_model=base_model,
             base_train=base_train,
             output_dir=root_dir,
+            batch_size_choices=args.batch_size_choices,
         )
         try:
             results = run_training(

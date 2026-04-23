@@ -42,13 +42,25 @@ def logits_from_probs(probs: np.ndarray, eps: float = 1e-7) -> np.ndarray:
     return np.log(clipped / (1.0 - clipped))
 
 
+_TEMPERATURE_MIN = 0.25
+_TEMPERATURE_MAX = 10.0
+
+
 def fit_temperature(
     logits: np.ndarray | list[float],
     labels: np.ndarray | list[float],
     max_iter: int = 200,
     lr: float = 0.01,
+    t_min: float = _TEMPERATURE_MIN,
+    t_max: float = _TEMPERATURE_MAX,
 ) -> TemperatureResult:
-    """Fit a single-parameter temperature T minimizing BCE(logits / T, labels)."""
+    """Fit a single-parameter temperature T minimizing BCE(logits / T, labels).
+
+    T is clamped to ``[t_min, t_max]`` (default [0.25, 10.0]). Small val splits
+    with saturated logits can otherwise drive LBFGS toward pathological T values
+    (e.g. T=100+) that collapse all probabilities near 0.5 and destroy the
+    threshold ranking.
+    """
     logits_arr = np.asarray(logits, dtype=np.float64).reshape(-1)
     labels_arr = np.asarray(labels, dtype=np.float64).reshape(-1)
     if logits_arr.size == 0:
@@ -77,6 +89,7 @@ def fit_temperature(
     temperature = float(torch.exp(log_temp).detach().item())
     if not np.isfinite(temperature) or temperature <= 0.0:
         temperature = 1.0
+    temperature = float(np.clip(temperature, t_min, t_max))
 
     scaled = logits_arr / temperature
     nll_after = _bce_from_logits_np(scaled, labels_arr)
