@@ -115,6 +115,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tabular-hidden-dim", type=int, default=16)
     parser.add_argument("--decision-threshold", type=float, default=0.5)
     parser.add_argument("--flip-axes", nargs="+", type=int, default=(1, 2))
+    parser.add_argument(
+        "--architecture",
+        choices=["resnet3d", "unet3d", "pointnet"],
+        default="resnet3d",
+        help="Backbone architecture to search over. Defaults to resnet3d to preserve prior behavior.",
+    )
     parser.add_argument("--final-epochs", type=int, default=None,
                         help="Epochs for the best_run final retrain (defaults to the best trial's epoch budget).")
     parser.add_argument("--primary-metric",
@@ -136,6 +142,7 @@ def _sample_trial_configs(
     base_train: TrainConfig,
     output_dir: Path,
     batch_size_choices: list[int] | None = None,
+    architecture: str = "resnet3d",
 ) -> tuple[DataConfig, AugmentationConfig, ModelConfig, TrainConfig]:
     target_edge = trial.suggest_categorical("target_edge", [48, 64, 80])
     flip_axes_choice = trial.suggest_categorical("flip_axes", list(_FLIP_AXIS_CHOICES))
@@ -193,7 +200,7 @@ def _sample_trial_configs(
     else:
         aug_config = replace(base_aug, enabled=False)
 
-    architecture = "resnet3d"
+    trial.set_user_attr("architecture", architecture)
     depth = base_model.depth
     base_channels_val = base_model.base_channels
     unet_depth = base_model.unet_depth
@@ -357,6 +364,7 @@ def _configs_from_params(
     base_train: TrainConfig,
     output_dir: Path,
     epochs_override: int | None = None,
+    architecture_override: str | None = None,
 ) -> tuple[DataConfig, AugmentationConfig, ModelConfig, TrainConfig]:
     """Rebuild configs from a finished trial's params dict (no suggest_ calls)."""
     edge = params["target_edge"]
@@ -394,7 +402,7 @@ def _configs_from_params(
         aug_config = replace(base_aug, enabled=False)
     # Missing "architecture" key means this trial was produced before the U-Net
     # integration — fall back to ResNet3D for backward compatibility.
-    architecture = params.get("architecture", "resnet3d")
+    architecture = architecture_override or params.get("architecture", "resnet3d")
     pointnet_mlp_variant = params.get("pointnet_mlp_variant")
     pointnet_mlp_channels = {
         "small": (64, 128),
@@ -545,6 +553,7 @@ def main() -> None:
             base_train=base_train,
             output_dir=root_dir,
             batch_size_choices=args.batch_size_choices,
+            architecture=args.architecture,
         )
         try:
             results = run_training(
@@ -610,6 +619,7 @@ def main() -> None:
         base_train=base_train,
         output_dir=best_run_dir,
         epochs_override=final_epochs,
+        architecture_override=args.architecture,
     )
     final_results = run_training(
         data_config=data_cfg,
