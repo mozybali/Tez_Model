@@ -566,12 +566,13 @@ def run_training(
             marker = "*" if improved else " "
             roc = val_metrics.get("roc_auc")
             roc_str = f"{roc:.4f}" if roc is not None and not math.isnan(roc) else "N/A"
+            primary_label = f"val_{train_config.primary_metric}"
             print(
                 f"  [{marker}] Epoch {epoch:03d}/{train_config.epochs:03d}  "
                 f"train_loss={train_metrics['loss']:.4f}  "
                 f"val_loss={val_metrics['loss']:.4f}  "
                 f"val_roc_auc={roc_str}  "
-                f"score={score:.4f}  "
+                f"{primary_label}={score:.4f}  "
                 f"patience={patience_counter}/{train_config.early_stopping_patience}"
             )
 
@@ -783,7 +784,16 @@ def run_training(
         if test_metrics:
             roc = test_metrics.get("roc_auc")
             roc_str = f"{roc:.4f}" if roc is not None and not math.isnan(roc) else "N/A"
-            print(f"  Best epoch: {best_epoch} | Test ROC-AUC: {roc_str}")
+            primary_value = test_metrics.get(train_config.primary_metric)
+            primary_str = (
+                f"{primary_value:.4f}"
+                if primary_value is not None and not math.isnan(primary_value)
+                else "N/A"
+            )
+            print(
+                f"  Best epoch: {best_epoch} | Test ROC-AUC: {roc_str} | "
+                f"Test {train_config.primary_metric}: {primary_str}"
+            )
             if test_ci:
                 print("  Bootstrap 95% CI:")
                 for key, ci_vals in test_ci.items():
@@ -992,7 +1002,16 @@ def run_cross_validation(
         if not quiet:
             roc = best_val_metrics.get("roc_auc")
             roc_str = f"{roc:.4f}" if roc is not None and not math.isnan(roc) else "N/A"
-            print(f"  Fold {fold_idx + 1} | Best epoch: {best_epoch} | Val ROC-AUC: {roc_str}")
+            primary_value = best_val_metrics.get(fold_train_config.primary_metric)
+            primary_str = (
+                f"{primary_value:.4f}"
+                if primary_value is not None and not math.isnan(primary_value)
+                else "N/A"
+            )
+            print(
+                f"  Fold {fold_idx + 1} | Best epoch: {best_epoch} | "
+                f"Val ROC-AUC: {roc_str} | Val {fold_train_config.primary_metric}: {primary_str}"
+            )
 
     # Aggregate fold validation metrics
     metric_keys = [k for k in fold_results[0]["best_val_metrics"] if isinstance(fold_results[0]["best_val_metrics"][k], (int, float))]

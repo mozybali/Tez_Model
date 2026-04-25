@@ -576,6 +576,7 @@ def main() -> None:
         # Save per-trial summary into the trial folder
         trial_summary = {
             "trial_number": trial.number,
+            "primary_metric": train_cfg.primary_metric,
             "params": trial.params,
             "score": _nan_safe(score),
             "best_epoch": results["best_epoch"],
@@ -637,6 +638,7 @@ def main() -> None:
     # Study-level summary
     study_summary = {
         "study_name": search_config.study_name,
+        "primary_metric": args.primary_metric,
         "n_trials_completed": len(study.trials),
         "best_trial_number": best_trial.number,
         "best_value": _nan_safe(best_trial.value),
