@@ -6,12 +6,20 @@ import numpy as np
 from sklearn.metrics import (
     average_precision_score,
     balanced_accuracy_score,
+    cohen_kappa_score,
     confusion_matrix,
     f1_score,
+    matthews_corrcoef,
     precision_score,
     recall_score,
     roc_auc_score,
 )
+
+
+def _safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
+    if denominator <= 0:
+        return float(default)
+    return float(numerator) / float(denominator)
 
 
 def compute_binary_classification_metrics(
@@ -19,35 +27,136 @@ def compute_binary_classification_metrics(
     y_prob: list[float] | np.ndarray,
     threshold: float = 0.5,
 ) -> dict[str, float]:
+    """Compute the full binary-classification metric bundle used across the project.
+
+    Existing keys (preserved for JSON backward-compatibility):
+        threshold, accuracy, balanced_accuracy, f1, precision, recall,
+        support, support_positive, support_negative, roc_auc, pr_auc,
+        tn, fp, fn, tp.
+
+    Newly added keys:
+        sensitivity, recall_positive, precision_positive, f1_positive,
+        specificity, npv, fpr, fnr, fdr, for, mcc, cohen_kappa,
+        macro_precision, macro_recall, macro_f1,
+        weighted_precision, weighted_recall, weighted_f1.
+
+    ROC-AUC and PR-AUC fall back to NaN when ``y_true`` only contains one class.
+    """
     y_true_array = np.asarray(y_true, dtype=np.int64)
     y_prob_array = np.asarray(y_prob, dtype=np.float64)
     y_pred_array = (y_prob_array >= threshold).astype(np.int64)
 
+    n_samples = int(y_true_array.shape[0])
+    cm = confusion_matrix(y_true_array, y_pred_array, labels=[0, 1])
+    tn, fp, fn, tp = (int(v) for v in cm.ravel())
+
+    sensitivity = _safe_divide(tp, tp + fn)         # recall on positive class
+    specificity = _safe_divide(tn, tn + fp)
+    precision_pos = _safe_divide(tp, tp + fp)
+    npv = _safe_divide(tn, tn + fn)
+    fpr = _safe_divide(fp, fp + tn)
+    fnr = _safe_divide(fn, fn + tp)
+    fdr = _safe_divide(fp, fp + tp)
+    for_rate = _safe_divide(fn, fn + tn)
+    f1_pos = _safe_divide(2.0 * precision_pos * sensitivity, precision_pos + sensitivity)
+
+    # Matthews correlation coefficient — guard the sqrt denominator manually so a
+    # single-class prediction returns 0 instead of nan.
+    mcc_denom = math.sqrt(float((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)))
+    mcc = _safe_divide(tp * tn - fp * fn, mcc_denom) if mcc_denom > 0 else 0.0
+
     metrics: dict[str, float] = {
         "threshold": float(threshold),
-        "accuracy": float((y_true_array == y_pred_array).mean()),
-        "balanced_accuracy": float(balanced_accuracy_score(y_true_array, y_pred_array)),
+        "accuracy": float((y_true_array == y_pred_array).mean()) if n_samples > 0 else 0.0,
+        "balanced_accuracy": float(balanced_accuracy_score(y_true_array, y_pred_array)) if n_samples > 0 else 0.0,
         "f1": float(f1_score(y_true_array, y_pred_array, zero_division=0)),
         "precision": float(precision_score(y_true_array, y_pred_array, zero_division=0)),
         "recall": float(recall_score(y_true_array, y_pred_array, zero_division=0)),
-        "support": float(len(y_true_array)),
+        "support": float(n_samples),
         "support_positive": float(y_true_array.sum()),
         "support_negative": float((1 - y_true_array).sum()),
+        # New positive-class aliases
+        "sensitivity": sensitivity,
+        "recall_positive": sensitivity,
+        "precision_positive": precision_pos,
+        "f1_positive": f1_pos,
+        "specificity": specificity,
+        # Confusion-matrix-derived rates
+        "npv": npv,
+        "fpr": fpr,
+        "fnr": fnr,
+        "fdr": fdr,
+        "for": for_rate,
+        # Agreement statistics
+        "mcc": mcc,
+        "cohen_kappa": float(cohen_kappa_score(y_true_array, y_pred_array, labels=[0, 1])),
+        # Macro / weighted averages
+        "macro_precision": float(precision_score(y_true_array, y_pred_array, average="macro", zero_division=0)),
+        "macro_recall": float(recall_score(y_true_array, y_pred_array, average="macro", zero_division=0)),
+        "macro_f1": float(f1_score(y_true_array, y_pred_array, average="macro", zero_division=0)),
+        "weighted_precision": float(precision_score(y_true_array, y_pred_array, average="weighted", zero_division=0)),
+        "weighted_recall": float(recall_score(y_true_array, y_pred_array, average="weighted", zero_division=0)),
+        "weighted_f1": float(f1_score(y_true_array, y_pred_array, average="weighted", zero_division=0)),
     }
 
     if len(np.unique(y_true_array)) > 1:
-        metrics["roc_auc"] = float(roc_auc_score(y_true_array, y_prob_array))
-        metrics["pr_auc"] = float(average_precision_score(y_true_array, y_prob_array))
+        try:
+            metrics["roc_auc"] = float(roc_auc_score(y_true_array, y_prob_array))
+        except ValueError:
+            metrics["roc_auc"] = math.nan
+        try:
+            metrics["pr_auc"] = float(average_precision_score(y_true_array, y_prob_array))
+        except ValueError:
+            metrics["pr_auc"] = math.nan
     else:
         metrics["roc_auc"] = math.nan
         metrics["pr_auc"] = math.nan
 
-    tn, fp, fn, tp = confusion_matrix(y_true_array, y_pred_array, labels=[0, 1]).ravel()
+    # Sanity: matthews_corrcoef gives the same result; we keep our own derivation
+    # so the value lines up with the (tn, fp, fn, tp) we just reported, but cross-check
+    # if both classes were predicted.
+    if 0 < (tp + fn) < n_samples and 0 < (tp + fp) < n_samples:
+        try:
+            metrics["mcc"] = float(matthews_corrcoef(y_true_array, y_pred_array))
+        except ValueError:
+            pass
+
     metrics["tn"] = float(tn)
     metrics["fp"] = float(fp)
     metrics["fn"] = float(fn)
     metrics["tp"] = float(tp)
     return metrics
+
+
+def compute_per_class_report(
+    y_true: list[float] | np.ndarray,
+    y_prob: list[float] | np.ndarray,
+    threshold: float = 0.5,
+    class_names: tuple[str, str] = ("Negative", "Positive"),
+) -> dict[str, dict[str, float]]:
+    """Per-class precision / recall / F1 / support broken out by label.
+
+    Companion to ``compute_binary_classification_metrics``. Useful when callers
+    want the same numbers shaped for tabular reporting (e.g. ``evaluate_final``).
+    """
+    y_true_array = np.asarray(y_true, dtype=np.int64)
+    y_prob_array = np.asarray(y_prob, dtype=np.float64)
+    y_pred_array = (y_prob_array >= threshold).astype(np.int64)
+
+    return {
+        class_names[0]: {
+            "precision": float(precision_score(y_true_array, y_pred_array, pos_label=0, zero_division=0)),
+            "recall": float(recall_score(y_true_array, y_pred_array, pos_label=0, zero_division=0)),
+            "f1": float(f1_score(y_true_array, y_pred_array, pos_label=0, zero_division=0)),
+            "support": int((y_true_array == 0).sum()),
+        },
+        class_names[1]: {
+            "precision": float(precision_score(y_true_array, y_pred_array, pos_label=1, zero_division=0)),
+            "recall": float(recall_score(y_true_array, y_pred_array, pos_label=1, zero_division=0)),
+            "f1": float(f1_score(y_true_array, y_pred_array, pos_label=1, zero_division=0)),
+            "support": int((y_true_array == 1).sum()),
+        },
+    }
 
 
 def optimize_threshold(
@@ -156,4 +265,3 @@ def select_model_score(metrics: dict[str, float], primary_metric: str = "roc_auc
     if loss is not None:
         return -float(loss)
     return float("-inf")
-

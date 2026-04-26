@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -31,12 +32,7 @@ from sklearn.metrics import (
     auc,
     average_precision_score,
     classification_report,
-    confusion_matrix,
-    f1_score,
     precision_recall_curve,
-    precision_score,
-    recall_score,
-    roc_auc_score,
     roc_curve,
 )
 
@@ -49,6 +45,7 @@ from Model.engine import (
 )
 from Utils.calibration import apply_temperature, logits_from_probs
 from Utils.config import AugmentationConfig, DataConfig, ModelConfig, TrainConfig
+from Utils.metrics import compute_binary_classification_metrics, compute_per_class_report
 
 CLASS_NAMES: tuple[str, str] = ("Normal", "Anomaly")
 DPI = 220
@@ -194,68 +191,27 @@ def obtain_predictions(
 # ────────────────────────────────── metrics ─────────────────────────────────
 
 def compute_all_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> dict[str, Any]:
+    """Wrap the shared binary-metric helper and add per-class / report fields.
+
+    All numeric metrics come from ``Utils.metrics.compute_binary_classification_metrics``
+    so plots, JSON outputs, and engine logs cannot disagree on a metric's value.
+    """
+    metrics = compute_binary_classification_metrics(y_true.tolist(), y_prob.tolist(), threshold=threshold)
+
+    # Cast the confusion-matrix counts to ints for nicer JSON / table rendering.
+    for key in ("tn", "fp", "fn", "tp", "support", "support_positive", "support_negative"):
+        if key in metrics:
+            metrics[key] = int(metrics[key])
+
+    per_class = compute_per_class_report(y_true.tolist(), y_prob.tolist(), threshold=threshold, class_names=CLASS_NAMES)
     y_pred = (y_prob >= threshold).astype(np.int64)
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    tn, fp, fn, tp = cm.ravel()
-    support_neg = int((y_true == 0).sum())
-    support_pos = int((y_true == 1).sum())
-
-    roc_auc_val = float(roc_auc_score(y_true, y_prob))
-    pr_auc_val = float(average_precision_score(y_true, y_prob))
-
-    specificity = float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0
-    sensitivity = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
-
-    per_class = {
-        CLASS_NAMES[0]: {
-            "precision": float(precision_score(y_true, y_pred, pos_label=0, zero_division=0)),
-            "recall": float(recall_score(y_true, y_pred, pos_label=0, zero_division=0)),
-            "f1": float(f1_score(y_true, y_pred, pos_label=0, zero_division=0)),
-            "support": support_neg,
-        },
-        CLASS_NAMES[1]: {
-            "precision": float(precision_score(y_true, y_pred, pos_label=1, zero_division=0)),
-            "recall": float(recall_score(y_true, y_pred, pos_label=1, zero_division=0)),
-            "f1": float(f1_score(y_true, y_pred, pos_label=1, zero_division=0)),
-            "support": support_pos,
-        },
-    }
-
-    macro_f1 = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
-    weighted_f1 = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
-    macro_precision = float(precision_score(y_true, y_pred, average="macro", zero_division=0))
-    weighted_precision = float(precision_score(y_true, y_pred, average="weighted", zero_division=0))
-    macro_recall = float(recall_score(y_true, y_pred, average="macro", zero_division=0))
-    weighted_recall = float(recall_score(y_true, y_pred, average="weighted", zero_division=0))
-
-    return {
-        "threshold": float(threshold),
-        "accuracy": float((y_true == y_pred).mean()),
-        "balanced_accuracy": 0.5 * (sensitivity + specificity),
-        "precision_positive": per_class[CLASS_NAMES[1]]["precision"],
-        "recall_positive": per_class[CLASS_NAMES[1]]["recall"],
-        "f1_positive": per_class[CLASS_NAMES[1]]["f1"],
-        "specificity": specificity,
-        "sensitivity": sensitivity,
-        "roc_auc": roc_auc_val,
-        "auc": roc_auc_val,  # alias — in binary case AUC == ROC-AUC
-        "pr_auc": pr_auc_val,
-        "macro_f1": macro_f1,
-        "weighted_f1": weighted_f1,
-        "macro_precision": macro_precision,
-        "weighted_precision": weighted_precision,
-        "macro_recall": macro_recall,
-        "weighted_recall": weighted_recall,
-        "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
-        "support": int(len(y_true)),
-        "support_positive": support_pos,
-        "support_negative": support_neg,
-        "per_class": per_class,
-        "classification_report": classification_report(
-            y_true, y_pred, labels=[0, 1], target_names=list(CLASS_NAMES),
-            digits=4, zero_division=0,
-        ),
-    }
+    metrics["auc"] = metrics.get("roc_auc")  # alias — in binary case AUC == ROC-AUC
+    metrics["per_class"] = per_class
+    metrics["classification_report"] = classification_report(
+        y_true, y_pred, labels=[0, 1], target_names=list(CLASS_NAMES),
+        digits=4, zero_division=0,
+    )
+    return metrics
 
 
 # ────────────────────────────────── plotting ────────────────────────────────
@@ -529,6 +485,177 @@ def interpretation(metrics_tuned: dict[str, Any], metrics_fixed: dict[str, Any],
     return "\n".join(lines)
 
 
+def _resolve_output_dir(run_dir: Path, output_dir: Path | None) -> tuple[Path, str, str]:
+    """Pick the architecture-prefixed output directory used by the CLI default."""
+    config_path = run_dir / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Missing config.json under {run_dir}")
+    peek_cfg = json.loads(config_path.read_text())
+    architecture = (peek_cfg.get("model", {}).get("architecture") or "resnet3d").lower()
+    arch_label = ARCHITECTURE_LABELS.get(architecture, architecture)
+
+    if output_dir is None:
+        default_out_name = f"{architecture}_{run_dir.name}"
+        output_dir = Path("results/final_evaluation") / default_out_name
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir, architecture, arch_label
+
+
+def _format_metric_summary(metrics: dict[str, Any], header: str) -> str:
+    """Build the multi-line terminal summary block for a metric dict."""
+    def _fmt(value: Any) -> str:
+        if value is None:
+            return "N/A"
+        try:
+            fvalue = float(value)
+        except (TypeError, ValueError):
+            return "N/A"
+        if math.isnan(fvalue) or math.isinf(fvalue):
+            return "N/A"
+        return f"{fvalue:.4f}"
+
+    lines = [
+        header,
+        f"    Accuracy        : {_fmt(metrics.get('accuracy'))}",
+        f"    Balanced Acc.   : {_fmt(metrics.get('balanced_accuracy'))}",
+        f"    ROC-AUC / AUC   : {_fmt(metrics.get('roc_auc'))}",
+        f"    PR-AUC          : {_fmt(metrics.get('pr_auc'))}",
+        f"    Sensitivity     : {_fmt(metrics.get('sensitivity'))}   "
+        f"Specificity: {_fmt(metrics.get('specificity'))}",
+        f"    Precision (pos) : {_fmt(metrics.get('precision_positive'))}   "
+        f"F1 (pos)  : {_fmt(metrics.get('f1_positive'))}",
+        f"    NPV             : {_fmt(metrics.get('npv'))}   "
+        f"FDR        : {_fmt(metrics.get('fdr'))}   FOR: {_fmt(metrics.get('for'))}",
+        f"    FPR             : {_fmt(metrics.get('fpr'))}   "
+        f"FNR        : {_fmt(metrics.get('fnr'))}",
+        f"    MCC             : {_fmt(metrics.get('mcc'))}   "
+        f"Cohen's kappa: {_fmt(metrics.get('cohen_kappa'))}",
+        f"    Macro F1        : {_fmt(metrics.get('macro_f1'))}   "
+        f"Weighted F1: {_fmt(metrics.get('weighted_f1'))}",
+        f"    Confusion Matrix: TN={metrics.get('tn')} FP={metrics.get('fp')} "
+        f"FN={metrics.get('fn')} TP={metrics.get('tp')}",
+    ]
+    return "\n".join(lines)
+
+
+def run_final_evaluation(
+    run_dir: Path,
+    output_dir: Path | None = None,
+    use_saved_predictions: bool = True,
+    threshold: float | None = None,
+) -> dict[str, Any]:
+    """Programmatic entry point used by the CLI and by ``Model.search``.
+
+    Returns the same dict that gets written to ``final_test_metrics.json``,
+    plus a ``figures`` map of generated plot paths and the ``output_dir``.
+    """
+    run_dir = Path(run_dir).resolve()
+    if not run_dir.exists():
+        raise FileNotFoundError(f"Run directory not found: {run_dir}")
+
+    output_dir, architecture, arch_label = _resolve_output_dir(run_dir, output_dir)
+    print(f"[info] run_dir      = {run_dir}")
+    print(f"[info] architecture = {arch_label} ({architecture})")
+    print(f"[info] output_dir   = {output_dir}")
+
+    saved_pred_path = run_dir / "test_predictions.json"
+    use_saved = bool(use_saved_predictions and saved_pred_path.exists())
+
+    bundle = obtain_predictions(run_dir=run_dir, output_dir=output_dir, use_saved=use_saved)
+    y_true = bundle["y_true"]
+    y_prob = bundle["y_prob_cal"]
+    tuned_threshold = float(threshold if threshold is not None else bundle["tuned_threshold"])
+    fixed_threshold = float(bundle["fixed_threshold"])
+
+    print(f"[info] predictions source = {bundle['source']}")
+    print(
+        f"[info] n_test = {len(y_true)}  "
+        f"positives = {int((y_true == 1).sum())}  "
+        f"negatives = {int((y_true == 0).sum())}"
+    )
+    print(
+        f"[info] temperature = {bundle['temperature']:.4f}  "
+        f"tuned_threshold = {tuned_threshold:.4f}  fixed_threshold = {fixed_threshold:.4f}"
+    )
+
+    metrics_tuned = compute_all_metrics(y_true, y_prob, threshold=tuned_threshold)
+    metrics_fixed = compute_all_metrics(y_true, y_prob, threshold=fixed_threshold)
+
+    # ── plots ──
+    cm = np.array([[metrics_tuned["tn"], metrics_tuned["fp"]],
+                   [metrics_tuned["fn"], metrics_tuned["tp"]]], dtype=np.int64)
+
+    fig_paths: dict[str, Path] = {
+        "confusion_matrix": output_dir / "01_confusion_matrix.png",
+        "roc_curve":        output_dir / "02_roc_curve.png",
+        "metric_bar":       output_dir / "03_metric_comparison.png",
+        "pr_curve":         output_dir / "04_precision_recall_curve.png",
+        "class_wise":       output_dir / "05_class_wise_metrics.png",
+        "summary_table":    output_dir / "06_per_class_summary.png",
+        "prob_hist":        output_dir / "07_probability_distribution.png",
+    }
+
+    plot_confusion_matrix(cm, fig_paths["confusion_matrix"], arch_label=arch_label)
+    plot_roc_curve(y_true, y_prob, fig_paths["roc_curve"], arch_label=arch_label)
+    plot_metric_comparison(metrics_tuned, fig_paths["metric_bar"], arch_label=arch_label)
+    plot_precision_recall(y_true, y_prob, fig_paths["pr_curve"], arch_label=arch_label)
+    plot_class_wise_metrics(metrics_tuned, fig_paths["class_wise"], arch_label=arch_label)
+    plot_per_class_support(metrics_tuned, fig_paths["summary_table"], arch_label=arch_label)
+    plot_probability_distribution(y_true, y_prob, tuned_threshold, fig_paths["prob_hist"], arch_label=arch_label)
+
+    # ── save textual outputs ──
+    serializable = {
+        "source": bundle["source"],
+        "run_dir": str(run_dir),
+        "architecture": bundle["architecture"],
+        "architecture_label": bundle["architecture_label"],
+        "temperature": bundle["temperature"],
+        "tuned_threshold": tuned_threshold,
+        "fixed_threshold": fixed_threshold,
+        "metrics_tuned_threshold": {k: v for k, v in metrics_tuned.items() if k != "classification_report"},
+        "metrics_fixed_threshold": {k: v for k, v in metrics_fixed.items() if k != "classification_report"},
+    }
+    (output_dir / "final_test_metrics.json").write_text(json.dumps(serializable, indent=2), encoding="utf-8")
+    (output_dir / "classification_report_tuned.txt").write_text(metrics_tuned["classification_report"], encoding="utf-8")
+    (output_dir / "classification_report_fixed.txt").write_text(metrics_fixed["classification_report"], encoding="utf-8")
+
+    # ── terminal summary ──
+    print("\n" + "=" * 70)
+    print("FINAL TEST-SET METRICS  (calibrated probabilities)".center(70))
+    print("=" * 70)
+    print(f"  Architecture     : {arch_label}")
+    print(f"  Source           : {bundle['source']}")
+    print(f"  Test support     : {metrics_tuned['support']} "
+          f"(pos={metrics_tuned['support_positive']}, neg={metrics_tuned['support_negative']})")
+    print(f"  Temperature      : {bundle['temperature']:.4f}")
+    print()
+    print(_format_metric_summary(metrics_tuned, f"  --- Tuned threshold  (t = {tuned_threshold:.4f}) ---"))
+    print()
+    print(_format_metric_summary(metrics_fixed, f"  --- Fixed threshold  (t = {fixed_threshold:.4f}) ---"))
+
+    print("\nClassification report (tuned threshold):")
+    print(metrics_tuned["classification_report"])
+
+    interp = interpretation(metrics_tuned, metrics_fixed, arch_label=arch_label)
+    (output_dir / "interpretation.txt").write_text(interp, encoding="utf-8")
+    try:
+        print(interp)
+    except UnicodeEncodeError:
+        print(interp.encode("ascii", "replace").decode("ascii"))
+
+    print("\nSaved figures:")
+    for key, p in fig_paths.items():
+        print(f"  {key:<20s} -> {p}")
+    print(f"\nAll outputs written to: {output_dir}")
+
+    return {
+        **serializable,
+        "output_dir": str(output_dir),
+        "figures": {k: str(p) for k, p in fig_paths.items()},
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Final test-set evaluation for the ALAN kidney classifier "
@@ -553,122 +680,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    run_dir = args.run_dir.resolve()
-    if not run_dir.exists():
-        raise FileNotFoundError(f"Run directory not found: {run_dir}")
-
-    # Peek at architecture so we can prefix the output dir before inference runs.
-    config_path = run_dir / "config.json"
-    if not config_path.exists():
-        raise FileNotFoundError(f"Missing config.json under {run_dir}")
-    peek_cfg = json.loads(config_path.read_text())
-    architecture = (peek_cfg.get("model", {}).get("architecture") or "resnet3d").lower()
-    arch_label = ARCHITECTURE_LABELS.get(architecture, architecture)
-
-    default_out_name = f"{architecture}_{run_dir.name}"
-    output_dir = (args.output_dir or Path("results/final_evaluation") / default_out_name).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"[info] run_dir      = {run_dir}")
-    print(f"[info] architecture = {arch_label} ({architecture})")
-    print(f"[info] output_dir   = {output_dir}")
-
-    bundle = obtain_predictions(run_dir=run_dir, output_dir=output_dir, use_saved=args.use_saved_predictions)
-    y_true = bundle["y_true"]
-    y_prob = bundle["y_prob_cal"]
-    threshold = float(args.threshold if args.threshold is not None else bundle["tuned_threshold"])
-    fixed_threshold = float(bundle["fixed_threshold"])
-
-    print(f"[info] predictions source = {bundle['source']}")
-    print(f"[info] n_test = {len(y_true)}  positives = {int((y_true == 1).sum())}  negatives = {int((y_true == 0).sum())}")
-    print(f"[info] temperature = {bundle['temperature']:.4f}  tuned_threshold = {threshold:.4f}  fixed_threshold = {fixed_threshold:.4f}")
-
-    metrics_tuned = compute_all_metrics(y_true, y_prob, threshold=threshold)
-    metrics_fixed = compute_all_metrics(y_true, y_prob, threshold=fixed_threshold)
-
-    # ── plots ──
-    cm = np.array([[metrics_tuned["tn"], metrics_tuned["fp"]],
-                   [metrics_tuned["fn"], metrics_tuned["tp"]]], dtype=np.int64)
-
-    fig_paths: dict[str, Path] = {
-        "confusion_matrix": output_dir / "01_confusion_matrix.png",
-        "roc_curve":        output_dir / "02_roc_curve.png",
-        "metric_bar":       output_dir / "03_metric_comparison.png",
-        "pr_curve":         output_dir / "04_precision_recall_curve.png",
-        "class_wise":       output_dir / "05_class_wise_metrics.png",
-        "summary_table":    output_dir / "06_per_class_summary.png",
-        "prob_hist":        output_dir / "07_probability_distribution.png",
-    }
-
-    arch_label = bundle["architecture_label"]
-
-    plot_confusion_matrix(cm, fig_paths["confusion_matrix"], arch_label=arch_label)
-    plot_roc_curve(y_true, y_prob, fig_paths["roc_curve"], arch_label=arch_label)
-    plot_metric_comparison(metrics_tuned, fig_paths["metric_bar"], arch_label=arch_label)
-    plot_precision_recall(y_true, y_prob, fig_paths["pr_curve"], arch_label=arch_label)
-    plot_class_wise_metrics(metrics_tuned, fig_paths["class_wise"], arch_label=arch_label)
-    plot_per_class_support(metrics_tuned, fig_paths["summary_table"], arch_label=arch_label)
-    plot_probability_distribution(y_true, y_prob, threshold, fig_paths["prob_hist"], arch_label=arch_label)
-
-    # ── save textual outputs ──
-    serializable = {
-        "source": bundle["source"],
-        "run_dir": str(run_dir),
-        "architecture": bundle["architecture"],
-        "architecture_label": bundle["architecture_label"],
-        "temperature": bundle["temperature"],
-        "tuned_threshold": threshold,
-        "fixed_threshold": fixed_threshold,
-        "metrics_tuned_threshold": {k: v for k, v in metrics_tuned.items() if k != "classification_report"},
-        "metrics_fixed_threshold": {k: v for k, v in metrics_fixed.items() if k != "classification_report"},
-    }
-    (output_dir / "final_test_metrics.json").write_text(json.dumps(serializable, indent=2), encoding="utf-8")
-    (output_dir / "classification_report_tuned.txt").write_text(metrics_tuned["classification_report"], encoding="utf-8")
-    (output_dir / "classification_report_fixed.txt").write_text(metrics_fixed["classification_report"], encoding="utf-8")
-
-    # ── terminal summary ──
-    print("\n" + "=" * 70)
-    print("FINAL TEST-SET METRICS  (calibrated probabilities)".center(70))
-    print("=" * 70)
-    print(f"  Architecture     : {arch_label}")
-    print(f"  Source           : {bundle['source']}")
-    print(f"  Test support     : {metrics_tuned['support']} "
-          f"(pos={metrics_tuned['support_positive']}, neg={metrics_tuned['support_negative']})")
-    print(f"  Temperature      : {bundle['temperature']:.4f}")
-    print()
-    print(f"  --- Tuned threshold  (t = {threshold:.4f}) ---")
-    print(f"    Accuracy       : {metrics_tuned['accuracy']:.4f}")
-    print(f"    Recall (Anom.) : {metrics_tuned['recall_positive']:.4f}")
-    print(f"    F1 Score (Anom): {metrics_tuned['f1_positive']:.4f}")
-    print(f"    AUC / ROC-AUC  : {metrics_tuned['roc_auc']:.4f}")
-    print(f"    PR-AUC         : {metrics_tuned['pr_auc']:.4f}")
-    print(f"    Specificity    : {metrics_tuned['specificity']:.4f}")
-    print(f"    Balanced Acc.  : {metrics_tuned['balanced_accuracy']:.4f}")
-    print(f"    Macro-F1       : {metrics_tuned['macro_f1']:.4f}   "
-          f"Weighted-F1: {metrics_tuned['weighted_f1']:.4f}")
-    print(f"    Confusion Mat. : TN={metrics_tuned['tn']} FP={metrics_tuned['fp']} "
-          f"FN={metrics_tuned['fn']} TP={metrics_tuned['tp']}")
-    print()
-    print(f"  --- Fixed threshold  (t = {fixed_threshold:.4f}) ---")
-    print(f"    Accuracy       : {metrics_fixed['accuracy']:.4f}")
-    print(f"    Recall (Anom.) : {metrics_fixed['recall_positive']:.4f}")
-    print(f"    F1 Score (Anom): {metrics_fixed['f1_positive']:.4f}")
-    print(f"    AUC / ROC-AUC  : {metrics_fixed['roc_auc']:.4f}")
-
-    print("\nClassification report (tuned threshold):")
-    print(metrics_tuned["classification_report"])
-
-    interp = interpretation(metrics_tuned, metrics_fixed, arch_label=arch_label)
-    (output_dir / "interpretation.txt").write_text(interp, encoding="utf-8")
-    try:
-        print(interp)
-    except UnicodeEncodeError:
-        print(interp.encode("ascii", "replace").decode("ascii"))
-
-    print("\nSaved figures:")
-    for key, p in fig_paths.items():
-        print(f"  {key:<20s} -> {p}")
-    print(f"\nAll outputs written to: {output_dir}")
+    run_final_evaluation(
+        run_dir=args.run_dir,
+        output_dir=args.output_dir,
+        use_saved_predictions=args.use_saved_predictions,
+        threshold=args.threshold,
+    )
 
 
 if __name__ == "__main__":

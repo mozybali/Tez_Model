@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,7 +9,11 @@ import numpy as np
 import torch
 
 from Preprocessing.dataset import crop_to_bbox, pad_to_cube, resize_volume, apply_nan_strategy
-from Utils.metrics import compute_binary_classification_metrics, select_model_score
+from Utils.metrics import (
+    compute_binary_classification_metrics,
+    compute_per_class_report,
+    select_model_score,
+)
 
 
 class PreprocessingFunctionsTest(unittest.TestCase):
@@ -40,11 +45,136 @@ class MetricsTest(unittest.TestCase):
         m = compute_binary_classification_metrics(y_true, y_prob)
         self.assertAlmostEqual(m["roc_auc"], 1.0)
         self.assertAlmostEqual(m["f1"], 1.0)
+        # Perfect predictions ⇒ MCC = 1, kappa = 1, no false negatives / positives.
+        self.assertAlmostEqual(m["mcc"], 1.0)
+        self.assertAlmostEqual(m["cohen_kappa"], 1.0)
+        self.assertEqual(m["fp"], 0.0)
+        self.assertEqual(m["fn"], 0.0)
+        self.assertAlmostEqual(m["fpr"], 0.0)
+        self.assertAlmostEqual(m["fnr"], 0.0)
 
     def test_select_model_score_fallback(self) -> None:
         metrics = {"roc_auc": float("nan"), "balanced_accuracy": 0.75}
         score = select_model_score(metrics, "roc_auc")
         self.assertAlmostEqual(score, 0.75)
+
+
+class ExtendedBinaryMetricsTest(unittest.TestCase):
+    """Verify the metrics added in the audit against hand-computed values.
+
+    Confusion matrix used below (threshold 0.5):
+        y_true = [1, 1, 1, 0, 0, 0, 0, 1, 0, 1]
+        y_prob = [0.9, 0.8, 0.7, 0.2, 0.1, 0.6, 0.4, 0.3, 0.55, 0.85]
+        y_pred = [1, 1, 1, 0, 0, 1, 0, 0, 1, 1]
+        ⇒ TP=4, FN=1, FP=2, TN=3   (n=10, positives=5, negatives=5)
+    """
+
+    def setUp(self) -> None:
+        self.y_true = [1, 1, 1, 0, 0, 0, 0, 1, 0, 1]
+        self.y_prob = [0.9, 0.8, 0.7, 0.2, 0.1, 0.6, 0.4, 0.3, 0.55, 0.85]
+        self.metrics = compute_binary_classification_metrics(self.y_true, self.y_prob, threshold=0.5)
+
+    def test_confusion_matrix_counts(self) -> None:
+        self.assertEqual(self.metrics["tp"], 4.0)
+        self.assertEqual(self.metrics["fn"], 1.0)
+        self.assertEqual(self.metrics["fp"], 2.0)
+        self.assertEqual(self.metrics["tn"], 3.0)
+        self.assertEqual(self.metrics["support"], 10.0)
+        self.assertEqual(self.metrics["support_positive"], 5.0)
+        self.assertEqual(self.metrics["support_negative"], 5.0)
+
+    def test_sensitivity_specificity_and_aliases(self) -> None:
+        self.assertAlmostEqual(self.metrics["sensitivity"], 4 / 5)
+        self.assertAlmostEqual(self.metrics["recall_positive"], 4 / 5)
+        self.assertAlmostEqual(self.metrics["specificity"], 3 / 5)
+        self.assertAlmostEqual(self.metrics["precision_positive"], 4 / 6)
+        # f1_positive = 2 * P * R / (P + R)
+        self.assertAlmostEqual(
+            self.metrics["f1_positive"],
+            (2 * (4 / 6) * (4 / 5)) / ((4 / 6) + (4 / 5)),
+        )
+
+    def test_negative_predictive_value_and_rates(self) -> None:
+        self.assertAlmostEqual(self.metrics["npv"], 3 / 4)        # TN / (TN + FN)
+        self.assertAlmostEqual(self.metrics["fpr"], 2 / 5)        # FP / (FP + TN)
+        self.assertAlmostEqual(self.metrics["fnr"], 1 / 5)        # FN / (FN + TP)
+        self.assertAlmostEqual(self.metrics["fdr"], 2 / 6)        # FP / (FP + TP)
+        self.assertAlmostEqual(self.metrics["for"], 1 / 4)        # FN / (FN + TN)
+
+    def test_mcc_and_cohen_kappa_match_hand_calculation(self) -> None:
+        # MCC = (TP*TN - FP*FN) / sqrt((TP+FP)(TP+FN)(TN+FP)(TN+FN))
+        expected_mcc = (4 * 3 - 2 * 1) / math.sqrt((4 + 2) * (4 + 1) * (3 + 2) * (3 + 1))
+        self.assertAlmostEqual(self.metrics["mcc"], expected_mcc, places=6)
+        # Cohen's kappa: po = 7/10; pe = (6*5 + 4*5)/100 = 0.5; kappa = (0.7 - 0.5)/(1 - 0.5)
+        self.assertAlmostEqual(self.metrics["cohen_kappa"], (0.7 - 0.5) / (1 - 0.5), places=6)
+
+    def test_macro_and_weighted_averages(self) -> None:
+        # With n_pos = n_neg = 5, macro and weighted averages must match.
+        self.assertAlmostEqual(self.metrics["macro_f1"], self.metrics["weighted_f1"])
+        self.assertAlmostEqual(self.metrics["macro_precision"], self.metrics["weighted_precision"])
+        self.assertAlmostEqual(self.metrics["macro_recall"], self.metrics["weighted_recall"])
+
+    def test_existing_keys_preserved(self) -> None:
+        # Backward-compatibility guard: every previously-emitted JSON key must remain.
+        for key in (
+            "threshold", "accuracy", "balanced_accuracy", "f1", "precision", "recall",
+            "support", "support_positive", "support_negative",
+            "roc_auc", "pr_auc", "tn", "fp", "fn", "tp",
+        ):
+            self.assertIn(key, self.metrics)
+
+    def test_per_class_report_shape(self) -> None:
+        report = compute_per_class_report(
+            self.y_true, self.y_prob, threshold=0.5, class_names=("Normal", "Anomaly"),
+        )
+        self.assertIn("Normal", report)
+        self.assertIn("Anomaly", report)
+        self.assertEqual(report["Anomaly"]["support"], 5)
+        self.assertAlmostEqual(report["Anomaly"]["recall"], 4 / 5)
+
+
+class SingleClassRobustnessTest(unittest.TestCase):
+    """ROC-AUC / PR-AUC must not crash when y_true contains a single class."""
+
+    def test_all_negative_y_true_returns_nan_aucs(self) -> None:
+        y_true = [0, 0, 0, 0]
+        y_prob = [0.1, 0.4, 0.7, 0.9]
+        m = compute_binary_classification_metrics(y_true, y_prob, threshold=0.5)
+        self.assertTrue(math.isnan(m["roc_auc"]))
+        self.assertTrue(math.isnan(m["pr_auc"]))
+        # Confusion-matrix rates must still be finite.
+        self.assertEqual(m["tp"], 0.0)
+        self.assertEqual(m["fn"], 0.0)
+        self.assertFalse(math.isnan(m["specificity"]))
+        self.assertFalse(math.isnan(m["mcc"]))
+
+    def test_all_positive_y_true_returns_nan_aucs(self) -> None:
+        y_true = [1, 1, 1, 1]
+        y_prob = [0.1, 0.4, 0.7, 0.9]
+        m = compute_binary_classification_metrics(y_true, y_prob, threshold=0.5)
+        self.assertTrue(math.isnan(m["roc_auc"]))
+        self.assertTrue(math.isnan(m["pr_auc"]))
+        self.assertEqual(m["tn"], 0.0)
+
+
+class FinalEvaluationImportTest(unittest.TestCase):
+    """The Optuna pipeline imports run_final_evaluation; guard the import surface."""
+
+    def test_run_final_evaluation_importable_with_signature(self) -> None:
+        import inspect
+
+        from evaluate_final import run_final_evaluation
+
+        signature = inspect.signature(run_final_evaluation)
+        params = signature.parameters
+        self.assertIn("run_dir", params)
+        self.assertIn("output_dir", params)
+        self.assertIn("use_saved_predictions", params)
+        self.assertIn("threshold", params)
+        # Default contract: saved predictions preferred, no threshold override.
+        self.assertIs(params["output_dir"].default, None)
+        self.assertEqual(params["use_saved_predictions"].default, True)
+        self.assertIs(params["threshold"].default, None)
 
 
 class SmokeTest(unittest.TestCase):

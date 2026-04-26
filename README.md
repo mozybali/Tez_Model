@@ -347,20 +347,65 @@ Testler veri seti dönüşümlerini, model çıktı şekillerini ve sentetik ver
 
 ## Metrikler
 
-Eğitim ve değerlendirme sırasında aşağıdaki metrikler hesaplanır:
+Tüm ikili sınıflandırma metrikleri tek bir kaynaktan, `Utils/metrics.py` içindeki `compute_binary_classification_metrics` fonksiyonundan üretilir. `Model/engine.py`, `Model/ensemble.py` ve `evaluate_final.py` aynı yardımcıyı çağırır; aynı metrik için farklı dosyalarda farklı formüller kullanılmaz.
 
-- loss
-- accuracy
-- balanced accuracy
-- precision
-- recall
-- F1 ve F-beta (eşik seçimi için)
-- ROC-AUC
-- PR-AUC
+Mevcut JSON çıktı anahtarları korunmuştur. Eğitim ve değerlendirme sırasında raporlanan metrikler:
+
+- `loss`
+- `accuracy`, `balanced_accuracy`
+- `precision`, `recall`, `f1` (pozitif sınıf — geriye dönük uyumluluk)
+- `precision_positive`, `recall_positive` (`= sensitivity`), `f1_positive`
+- `sensitivity`, `specificity`
+- `npv` (negative predictive value)
+- `fpr`, `fnr`, `fdr`, `for` (false positive / negative / discovery / omission rate)
+- `mcc` (Matthews correlation coefficient)
+- `cohen_kappa`
+- `macro_precision`, `macro_recall`, `macro_f1`
+- `weighted_precision`, `weighted_recall`, `weighted_f1`
+- `roc_auc`, `pr_auc` — `y_true` tek sınıf içerdiğinde güvenli şekilde `NaN` döner, fonksiyon hata vermez
+- F-beta (eşik seçimi için)
 - expected calibration error (ECE) — kalibrasyon öncesi/sonrası
-- confusion matrix bileşenleri (`tn`, `fp`, `fn`, `tp`)
+- confusion matrix bileşenleri: `tn`, `fp`, `fn`, `tp`
+- destek sayıları: `support`, `support_positive`, `support_negative`
+
+Bütün oran tabanlı metrikler bölme-payda sıfır olduğunda `0.0` döner; `mcc` payda sıfırlandığında 0, `roc_auc` / `pr_auc` ise `NaN` olur.
 
 Model seçimi varsayılan olarak `roc_auc` üzerinden yapılır. Seçilen metrik hesaplanamazsa sırasıyla `pr_auc`, `balanced_accuracy`, `f1` ve negatif loss değerine düşülür.
+
+## Final Değerlendirme (`evaluate_final.py`)
+
+`evaluate_final.py`, eğitilmiş bir koşuyu (`best_model.pt` + `config.json`) tekrar test setinde değerlendirip yukarıdaki tüm metrikleri (`final_test_metrics.json`) ve yüksek çözünürlüklü tanılayıcı çizimleri (`01_*.png` … `07_*.png`), sınıflandırma raporlarını ve kısa bir yorumu üretir. Mimari `config.json` içinden okunduğu için ResNet3D, U-Net3D ve PointNet koşuları aynı CLI ile değerlendirilebilir.
+
+Manuel kullanım:
+
+```bash
+python evaluate_final.py --run-dir outputs/optuna/best_run
+python evaluate_final.py --run-dir outputs/optuna/best_run --use-saved-predictions
+python evaluate_final.py --run-dir outputs/optuna/best_run --threshold 0.42
+```
+
+Programatik kullanım (Optuna araması ve diğer betikler bunu çağırır):
+
+```python
+from pathlib import Path
+from evaluate_final import run_final_evaluation
+
+result = run_final_evaluation(
+    run_dir=Path("outputs/optuna/best_run"),
+    output_dir=None,                # default: results/final_evaluation/<arch>_<run-dir-name>
+    use_saved_predictions=True,     # test_predictions.json varsa inferansı tekrar etme
+    threshold=None,                 # None → config.json'daki tuned threshold
+)
+```
+
+Optuna araması (`Model/search.py`) tamamlandığında en iyi parametrelerle `best_run/` altına yapılan final yeniden eğitiminin ardından `run_final_evaluation` **otomatik olarak** çağrılır:
+
+- Çıktı dizini `<search_output_dir>/final_evaluation/` altına yazılır.
+- `best_run/test_predictions.json` mevcutsa o dosya kullanılır (inferans tekrar edilmez); yoksa güvenli bir şekilde taze inferansa düşülür.
+- Final değerlendirme başarısız olursa eğitim çıktıları kaybolmaz; uyarı yazdırılır ve hata mesajı `study_summary.json` içindeki `final_evaluation.error` alanına kaydedilir.
+- Başarılı olduğunda `study_summary.json` içindeki `final_evaluation` bloğu çıktı dizinini ve özet metrikleri (tuned/fixed eşik için) içerir.
+
+Terminal özetinde gösterilen anahtar metrikler: accuracy, balanced accuracy, ROC-AUC, PR-AUC, sensitivity, specificity, precision, F1, MCC, Cohen's kappa ve confusion matrix.
 
 ## Notlar
 

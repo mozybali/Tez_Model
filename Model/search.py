@@ -635,6 +635,38 @@ def main() -> None:
     if best_model_src.exists():
         shutil.copy2(best_model_src, root_dir / "best_model.pt")
 
+    # ── Automatic final evaluation on the freshly retrained best_run ──
+    # Prefer the saved test_predictions.json so we don't repeat inference; fall
+    # back to fresh inference if the file is missing. Failures here must NOT
+    # destroy training artifacts — we capture the error in study_summary.
+    final_eval_dir = root_dir / "final_evaluation"
+    final_eval_summary: dict[str, object] = {"output_dir": str(final_eval_dir)}
+    try:
+        from evaluate_final import run_final_evaluation
+
+        saved_predictions_available = (best_run_dir / "test_predictions.json").exists()
+        print(f"\n  Running final evaluation on {best_run_dir} "
+              f"(use_saved_predictions={saved_predictions_available}) ...")
+        eval_result = run_final_evaluation(
+            run_dir=best_run_dir,
+            output_dir=final_eval_dir,
+            use_saved_predictions=saved_predictions_available,
+        )
+        tuned_metrics = eval_result.get("metrics_tuned_threshold", {}) or {}
+        fixed_metrics = eval_result.get("metrics_fixed_threshold", {}) or {}
+        final_eval_summary.update({
+            "output_dir": eval_result.get("output_dir", str(final_eval_dir)),
+            "source": eval_result.get("source"),
+            "tuned_threshold": eval_result.get("tuned_threshold"),
+            "fixed_threshold": eval_result.get("fixed_threshold"),
+            "metrics_tuned_threshold": {k: _nan_safe(v) for k, v in tuned_metrics.items() if not isinstance(v, dict)},
+            "metrics_fixed_threshold": {k: _nan_safe(v) for k, v in fixed_metrics.items() if not isinstance(v, dict)},
+        })
+    except Exception as exc:
+        message = f"final_evaluation_failed: {type(exc).__name__}: {exc}"
+        print(f"  Warning: {message}")
+        final_eval_summary["error"] = message
+
     # Study-level summary
     study_summary = {
         "study_name": search_config.study_name,
@@ -651,6 +683,7 @@ def main() -> None:
             "best_val_metrics": {k: _nan_safe(v) for k, v in final_results["best_val_metrics"].items()},
             "test_metrics": {k: _nan_safe(v) for k, v in final_results["test_metrics"].items()},
         },
+        "final_evaluation": final_eval_summary,
     }
     save_json(study_summary, root_dir / "study_summary.json")
     print(json.dumps(study_summary, indent=2))
