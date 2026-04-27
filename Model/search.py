@@ -131,6 +131,11 @@ def parse_args() -> argparse.Namespace:
                         choices=["none", "drop_record", "fill_zero", "fill_mean", "fill_median", "fill_constant"],
                         default="none")
     parser.add_argument("--nan-fill-value", type=float, default=0.0)
+    parser.add_argument(
+        "--force-augmentation",
+        action="store_true",
+        help="Force augmentations on for every trial (skip the on/off categorical and only search augmentation strength).",
+    )
     return parser.parse_args()
 
 
@@ -143,6 +148,7 @@ def _sample_trial_configs(
     output_dir: Path,
     batch_size_choices: list[int] | None = None,
     architecture: str = "resnet3d",
+    force_augmentation: bool = False,
 ) -> tuple[DataConfig, AugmentationConfig, ModelConfig, TrainConfig]:
     target_edge = trial.suggest_categorical("target_edge", [48, 64, 80])
     flip_axes_choice = trial.suggest_categorical("flip_axes", list(_FLIP_AXIS_CHOICES))
@@ -178,7 +184,11 @@ def _sample_trial_configs(
         nan_fill_value=nan_fill_value,
     )
 
-    augmentations_enabled = trial.suggest_categorical("augmentations_enabled", [True, False])
+    augmentations_enabled = (
+        True
+        if force_augmentation
+        else trial.suggest_categorical("augmentations_enabled", [True, False])
+    )
     if augmentations_enabled:
         aug_config = replace(
             base_aug,
@@ -554,6 +564,7 @@ def main() -> None:
             output_dir=root_dir,
             batch_size_choices=args.batch_size_choices,
             architecture=args.architecture,
+            force_augmentation=args.force_augmentation,
         )
         try:
             results = run_training(
