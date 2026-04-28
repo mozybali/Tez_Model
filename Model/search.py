@@ -123,6 +123,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--final-epochs", type=int, default=None,
                         help="Epochs for the best_run final retrain (defaults to the best trial's epoch budget).")
+    parser.add_argument("--final-patience", type=int, default=None,
+                        help="Early-stopping patience for the best_run final retrain. "
+                             "Overrides the best trial's sampled patience so a longer final budget "
+                             "(--final-epochs) isn't cut short. Defaults to the best trial's patience.")
     parser.add_argument("--primary-metric",
                         choices=["roc_auc", "pr_auc", "balanced_accuracy", "f1"],
                         default="roc_auc",
@@ -241,7 +245,7 @@ def _sample_trial_configs(
         )
     else:  # pointnet — conservative memory use on small-batch GPUs
         pointnet_num_points = trial.suggest_categorical(
-            "pointnet_num_points", [512, 1024, 2048, 4096]
+            "pointnet_num_points", [1024, 2048, 4096, 8192]
         )
         pointnet_global_dim = trial.suggest_categorical(
             "pointnet_global_dim", [256, 512, 1024]
@@ -257,14 +261,18 @@ def _sample_trial_configs(
         pointnet_head_hidden_dim = trial.suggest_categorical(
             "pointnet_head_hidden_dim", [0, 64, 128, 256]
         )
+        # Fixed at 4 so PointNet always sees (xyz, intensity) — the 4th channel
+        # now carries the real voxel intensity, not a constant occupancy=1.
         pointnet_point_features = trial.suggest_categorical(
-            "pointnet_point_features", [3, 4]
+            "pointnet_point_features", [4]
         )
         pointnet_use_input_transform = trial.suggest_categorical(
             "pointnet_use_input_transform", [False, True]
         )
+        # Fixed mid-value: 0.3 was too permissive (background bleed), 0.7 too
+        # restrictive on partial-volume voxels. Re-search later if needed.
         pointnet_binary_threshold = trial.suggest_categorical(
-            "pointnet_binary_threshold", [0.3, 0.5, 0.7]
+            "pointnet_binary_threshold", [0.5]
         )
     model_config = replace(
         base_model,
@@ -312,19 +320,34 @@ def _sample_trial_configs(
         else 0
     )
     loss_type = trial.suggest_categorical("loss_type", ["bce", "focal"])
+    # Narrowed lower bound: γ < 2 barely down-weights easy negatives, which is
+    # the regime we want to escape on this 3:1-imbalanced anomaly split.
     focal_gamma = (
-        trial.suggest_float("focal_gamma", 1.0, 3.0)
+        trial.suggest_float("focal_gamma", 2.0, 3.0)
         if loss_type == "focal"
         else base_train.focal_gamma
     )
+    # When the user explicitly optimizes F1 (--primary-metric f1), align the
+    # threshold selector: β=1.0 → F1. Otherwise keep recall-priority β ∈ [1.5, 2.5]
+    # (Youden/F1 don't penalize missed anomalies enough for the clinical use-case).
     threshold_selection = trial.suggest_categorical(
-        "threshold_selection", ["youden", "f1", "fbeta"],
+        "threshold_selection", ["fbeta"],
     )
-    threshold_fbeta = (
-        trial.suggest_float("threshold_fbeta", 1.0, 3.0)
-        if threshold_selection == "fbeta"
-        else base_train.threshold_fbeta
+    if base_train.primary_metric == "f1":
+        threshold_fbeta = 1.0
+    else:
+        threshold_fbeta = trial.suggest_float("threshold_fbeta", 1.5, 2.5)
+    # Narrowed strategy choices to the two that actually meaningfully reweight
+    # the minority class on this 3:1-imbalanced split. Mutual exclusion below:
+    # if the WeightedRandomSampler is on, batches are already balanced — adding
+    # loss reweighting on top double-counts and inflates the gradient.
+    sampled_pos_strategy = trial.suggest_categorical(
+        "pos_weight_strategy", ["effective", "inverse"]
     )
+    use_weighted_sampler = trial.suggest_categorical(
+        "use_weighted_sampler", [False, True]
+    )
+    pos_weight_strategy = "none" if use_weighted_sampler else sampled_pos_strategy
     train_config = replace(
         base_train,
         output_dir=output_dir / f"trial_{trial.number:03d}",
@@ -335,9 +358,7 @@ def _sample_trial_configs(
         sgd_momentum=sgd_momentum,
         scheduler_name=scheduler_name,
         warmup_epochs=warmup_epochs,
-        pos_weight_strategy=trial.suggest_categorical(
-            "pos_weight_strategy", ["ratio", "sqrt", "log", "inverse", "effective", "none"]
-        ),
+        pos_weight_strategy=pos_weight_strategy,
         loss_type=loss_type,
         focal_gamma=focal_gamma,
         batch_size=(
@@ -354,7 +375,7 @@ def _sample_trial_configs(
         ),
         # Tighter clip bounds — 5.0 was too loose and allowed the loss spike at epoch 2.
         gradient_clip_norm=trial.suggest_categorical("gradient_clip_norm", [0.25, 0.5, 1.0, 2.0]),
-        use_weighted_sampler=trial.suggest_categorical("use_weighted_sampler", [False, True]),
+        use_weighted_sampler=use_weighted_sampler,
         amp=trial.suggest_categorical("amp", [True, False]),
         threshold_selection=threshold_selection,
         threshold_fbeta=threshold_fbeta,
@@ -375,6 +396,7 @@ def _configs_from_params(
     output_dir: Path,
     epochs_override: int | None = None,
     architecture_override: str | None = None,
+    patience_override: int | None = None,
 ) -> tuple[DataConfig, AugmentationConfig, ModelConfig, TrainConfig]:
     """Rebuild configs from a finished trial's params dict (no suggest_ calls)."""
     edge = params["target_edge"]
@@ -459,6 +481,11 @@ def _configs_from_params(
             "pointnet_use_input_transform", base_model.pointnet_use_input_transform
         ),
     )
+    # Re-apply the sampler ↔ pos_weight mutual exclusion so the final retrain
+    # matches what the trial actually trained with.
+    sampler_on = params.get("use_weighted_sampler", base_train.use_weighted_sampler)
+    sampled_pos_strategy = params.get("pos_weight_strategy", base_train.pos_weight_strategy)
+    pos_weight_strategy = "none" if sampler_on else sampled_pos_strategy
     train_config = replace(
         base_train,
         output_dir=output_dir,
@@ -469,11 +496,15 @@ def _configs_from_params(
         sgd_momentum=params.get("sgd_momentum", base_train.sgd_momentum),
         scheduler_name=params["scheduler_name"],
         warmup_epochs=params.get("warmup_epochs", base_train.warmup_epochs),
-        pos_weight_strategy=params.get("pos_weight_strategy", base_train.pos_weight_strategy),
+        pos_weight_strategy=pos_weight_strategy,
         loss_type=params.get("loss_type", base_train.loss_type),
         focal_gamma=params.get("focal_gamma", base_train.focal_gamma),
         batch_size=params.get("batch_size", base_train.batch_size),
-        early_stopping_patience=params.get("early_stopping_patience", base_train.early_stopping_patience),
+        early_stopping_patience=(
+            patience_override
+            if patience_override is not None
+            else params.get("early_stopping_patience", base_train.early_stopping_patience)
+        ),
         gradient_clip_norm=params.get("gradient_clip_norm", base_train.gradient_clip_norm),
         use_weighted_sampler=params.get("use_weighted_sampler", base_train.use_weighted_sampler),
         amp=params.get("amp", base_train.amp),
@@ -632,6 +663,7 @@ def main() -> None:
         output_dir=best_run_dir,
         epochs_override=final_epochs,
         architecture_override=args.architecture,
+        patience_override=args.final_patience,
     )
     final_results = run_training(
         data_config=data_cfg,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 
@@ -20,11 +22,14 @@ def volume_to_pointcloud(
     num_points: int,
     training: bool,
     binary_threshold: float = 0.5,
+    include_intensity: bool = False,
 ) -> torch.Tensor:
-    """Convert a batch of binary 3D volumes to normalized point clouds.
+    """Convert a batch of 3D volumes to normalized point clouds.
 
-    Empty masks return zero points (a valid fallback that keeps downstream
-    shared-MLP / max-pool math well-defined).
+    When ``include_intensity`` is True, the 4th channel carries the original
+    voxel intensity at each sampled coordinate (useful for soft / continuous
+    masks where occupancy ≠ 1). Empty masks return zero points (a valid
+    fallback that keeps downstream shared-MLP / max-pool math well-defined).
     """
     if volume.ndim != 5 or volume.shape[1] != 1:
         raise ValueError(
@@ -42,7 +47,8 @@ def volume_to_pointcloud(
         dtype=dtype,
     )
 
-    out = torch.zeros(B, 3, num_points, device=device, dtype=dtype)
+    out_channels = 4 if include_intensity else 3
+    out = torch.zeros(B, out_channels, num_points, device=device, dtype=dtype)
     for b in range(B):
         mask = volume[b, 0] > binary_threshold
         coords = mask.nonzero(as_tuple=False)
@@ -59,8 +65,45 @@ def volume_to_pointcloud(
         else:
             idx = torch.arange(num_points, device=device) % n
 
-        out[b] = normalized.index_select(0, idx).t().contiguous()
+        out[b, :3] = normalized.index_select(0, idx).t().contiguous()
+        if include_intensity:
+            voxel_indices = coords.index_select(0, idx).long()
+            intensities = volume[b, 0][
+                voxel_indices[:, 0], voxel_indices[:, 1], voxel_indices[:, 2]
+            ]
+            out[b, 3] = intensities.to(dtype)
     return out
+
+
+def _augment_points(points: torch.Tensor) -> torch.Tensor:
+    """Stochastic 3D point-cloud augmentation: small rotation, scaling, jitter.
+
+    Operates only on xyz channels; any extra channels (e.g. intensity at
+    index 3) are passed through untouched. Geometry is mild — the goal is to
+    regularize, not to deform anatomy.
+    """
+    B, _, _ = points.shape
+    device = points.device
+    dtype = points.dtype
+
+    # Rotation in the (axis 1, axis 2) plane — typically the axial slice
+    # plane after our (D, H, W) normalization. ±15° matches MONAI defaults
+    # for kidney CT.
+    angles = (torch.rand(B, device=device, dtype=dtype) - 0.5) * (math.pi / 6.0)
+    cos_a = angles.cos().view(B, 1)
+    sin_a = angles.sin().view(B, 1)
+    h = points[:, 1].clone()
+    w = points[:, 2].clone()
+    points[:, 1] = cos_a * h - sin_a * w
+    points[:, 2] = sin_a * h + cos_a * w
+
+    # Anisotropic scaling — one factor per sample, applied to all xyz axes.
+    scale_factor = 0.9 + 0.2 * torch.rand(B, 1, 1, device=device, dtype=dtype)
+    points[:, :3] = points[:, :3] * scale_factor
+
+    # Per-point Gaussian jitter; σ = 0.01 in normalized [-1, 1] space ≈ 1 voxel.
+    points[:, :3] = points[:, :3] + 0.01 * torch.randn_like(points[:, :3])
+    return points
 
 
 class _InputTransform(nn.Module):
@@ -222,18 +265,17 @@ class PointNetClassifier(nn.Module):
                     nn.init.constant_(module.bias, 0)
 
     def _prepare_points(self, volume: torch.Tensor) -> torch.Tensor:
-        points = volume_to_pointcloud(
-            volume,
-            num_points=self.num_points,
-            training=self.training,
-            binary_threshold=self.binary_threshold,
-        )
-        if self.point_features == 4:
-            # Append occupancy feature (=1 for all points, including fallback zeros).
-            occupancy = torch.ones(
-                points.shape[0], 1, points.shape[2], device=points.device, dtype=points.dtype
+        include_intensity = self.point_features == 4
+        with torch.no_grad():
+            points = volume_to_pointcloud(
+                volume,
+                num_points=self.num_points,
+                training=self.training,
+                binary_threshold=self.binary_threshold,
+                include_intensity=include_intensity,
             )
-            points = torch.cat([points, occupancy], dim=1)
+            if self.training:
+                points = _augment_points(points)
         return points
 
     def forward(
