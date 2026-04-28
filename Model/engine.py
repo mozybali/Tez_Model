@@ -968,7 +968,17 @@ def run_cross_validation(
                 optimizer=None, device=device, amp_enabled=False,
                 tabular_feature_stats=tabular_feature_stats,
             )
-            val_threshold = optimize_threshold(val_y_true, val_y_prob, method="youden")
+            # Honor the configured threshold method so CV scoring matches what
+            # run_training would deploy (e.g. fbeta when HPO optimizes F1).
+            fold_threshold_method = getattr(fold_train_config, "threshold_selection", "youden")
+            fold_threshold_beta = float(getattr(fold_train_config, "threshold_fbeta", 1.0))
+            if fold_threshold_method == "fixed":
+                val_threshold = float(fold_train_config.decision_threshold)
+            else:
+                val_threshold = optimize_threshold(
+                    val_y_true, val_y_prob,
+                    method=fold_threshold_method, beta=fold_threshold_beta,
+                )
             val_metrics = compute_binary_classification_metrics(
                 y_true=val_y_true, y_prob=val_y_prob, threshold=val_threshold,
             )

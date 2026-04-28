@@ -16,9 +16,10 @@ import shutil
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import optuna
 
-from Model.engine import run_training, save_json, make_json_safe
+from Model.engine import run_cross_validation, run_training, save_json, make_json_safe
 from Utils.config import AugmentationConfig, DataConfig, ModelConfig, SearchConfig, TrainConfig, to_serializable
 
 
@@ -88,6 +89,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--study-name", default="alan_resnet3d")
     parser.add_argument("--n-trials", type=int, default=15)
     parser.add_argument("--timeout-seconds", type=int, default=None)
+    parser.add_argument(
+        "--n-folds",
+        type=int,
+        default=1,
+        help="Use k-fold CV for the HPO objective (mean primary metric across folds). "
+             "Default 1 = single ZS-train/ZS-dev split (legacy behavior). "
+             "Common choices: 3 for ResNet3D/UNet3D, 5 for PointNet. "
+             "The final best_run retrain always uses the single ZS split, regardless of this flag.",
+    )
     parser.add_argument(
         "--epochs",
         type=int,
@@ -597,34 +607,88 @@ def main() -> None:
             architecture=args.architecture,
             force_augmentation=args.force_augmentation,
         )
+        use_cv = args.n_folds > 1
         try:
-            results = run_training(
-                data_config=data_cfg,
-                augmentation_config=aug_cfg,
-                model_config=model_cfg,
-                train_config=train_cfg,
-                quiet=False,
-                skip_test=True,
-            )
+            if use_cv:
+                cv_results = run_cross_validation(
+                    data_config=data_cfg,
+                    augmentation_config=aug_cfg,
+                    model_config=model_cfg,
+                    train_config=train_cfg,
+                    n_folds=args.n_folds,
+                    quiet=False,
+                )
+            else:
+                results = run_training(
+                    data_config=data_cfg,
+                    augmentation_config=aug_cfg,
+                    model_config=model_cfg,
+                    train_config=train_cfg,
+                    quiet=False,
+                    skip_test=True,
+                )
         except Exception as exc:
             print(f"  Trial {trial.number} failed: {exc}")
             raise optuna.TrialPruned() from exc
 
-        trial.set_user_attr("best_val_metrics", results["best_val_metrics"])
-        trial.set_user_attr("output_dir", results["output_dir"])
+        if use_cv:
+            primary = train_cfg.primary_metric
+            fold_scores = [
+                fr["best_val_metrics"].get(primary)
+                for fr in cv_results["fold_results"]
+            ]
+            fold_scores = [
+                float(s) for s in fold_scores
+                if s is not None and not (isinstance(s, float) and math.isnan(s))
+            ]
+            if not fold_scores:
+                # All folds returned NaN for the primary metric — treat as failure.
+                raise optuna.TrialPruned("All folds returned NaN for primary metric.")
+            score = float(sum(fold_scores) / len(fold_scores))
+            agg = cv_results.get("aggregated_val_metrics", {})
+            output_dir_str = str(train_cfg.output_dir)
+            trial.set_user_attr("cv_fold_scores", fold_scores)
+            trial.set_user_attr("aggregated_val_metrics", agg)
+            trial.set_user_attr("output_dir", output_dir_str)
 
-        score = float(results["best_score"])
+            # Use the per-metric mean across folds as the "best_val_metrics"
+            # surrogate so the leaderboard schema stays compatible.
+            mean_val_metrics = {
+                key: stats["mean"] for key, stats in agg.items()
+                if isinstance(stats, dict) and "mean" in stats
+            }
+            best_epochs = [fr.get("best_epoch") for fr in cv_results["fold_results"]]
+            trial_summary = {
+                "trial_number": trial.number,
+                "primary_metric": primary,
+                "params": trial.params,
+                "score": _nan_safe(score),
+                "best_epoch": best_epochs,
+                "n_folds": args.n_folds,
+                "cv_fold_scores": fold_scores,
+                "cv_score_mean": _nan_safe(score),
+                "cv_score_std": _nan_safe(
+                    float(np.std(fold_scores)) if len(fold_scores) > 1 else 0.0
+                ),
+                "best_val_metrics": {k: _nan_safe(v) for k, v in mean_val_metrics.items()},
+                "fold_results": cv_results["fold_results"],
+            }
+            save_json(trial_summary, Path(output_dir_str) / "trial_summary.json")
+        else:
+            trial.set_user_attr("best_val_metrics", results["best_val_metrics"])
+            trial.set_user_attr("output_dir", results["output_dir"])
 
-        # Save per-trial summary into the trial folder
-        trial_summary = {
-            "trial_number": trial.number,
-            "primary_metric": train_cfg.primary_metric,
-            "params": trial.params,
-            "score": _nan_safe(score),
-            "best_epoch": results["best_epoch"],
-            "best_val_metrics": {k: _nan_safe(v) for k, v in results["best_val_metrics"].items()},
-        }
-        save_json(trial_summary, Path(results["output_dir"]) / "trial_summary.json")
+            score = float(results["best_score"])
+
+            trial_summary = {
+                "trial_number": trial.number,
+                "primary_metric": train_cfg.primary_metric,
+                "params": trial.params,
+                "score": _nan_safe(score),
+                "best_epoch": results["best_epoch"],
+                "best_val_metrics": {k: _nan_safe(v) for k, v in results["best_val_metrics"].items()},
+            }
+            save_json(trial_summary, Path(results["output_dir"]) / "trial_summary.json")
 
         # Append to leaderboard
         leaderboard.append(trial_summary)
