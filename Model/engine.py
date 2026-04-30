@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import math
 from contextlib import nullcontext
@@ -31,6 +32,19 @@ from Utils.reproducibility import seed_everything
 
 
 TABULAR_FEATURE_NAMES = ("log_voxel_count_z", "side_is_left")
+
+
+def release_gpu_memory() -> None:
+    """Drop Python GC garbage and ask CUDA to release the caching allocator.
+
+    Without this, repeated trainings (Optuna trials, CV folds) accumulate
+    fragmentation in the PyTorch caching allocator and eventually OOM even
+    though no live tensors remain.
+    """
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
 def resolve_device(device_name: str) -> torch.device:
@@ -583,8 +597,9 @@ def run_training(
 
     # Load best checkpoint
     if best_checkpoint.exists():
-        checkpoint = torch.load(best_checkpoint, map_location=device, weights_only=True)
+        checkpoint = torch.load(best_checkpoint, map_location="cpu", weights_only=True)
         model.load_state_dict(checkpoint["model_state_dict"])
+        del checkpoint
 
     # Collect validation predictions once; reuse for calibration, threshold selection, and plots.
     tta_enabled = bool(getattr(train_config, "tta_enabled", False))
@@ -809,7 +824,7 @@ def run_training(
             if not quiet:
                 print(f"  Warning: plot generation failed: {exc}")
 
-    return {
+    result = {
         "output_dir": str(output_dir),
         "best_epoch": best_epoch,
         "best_score": best_score,
@@ -823,6 +838,9 @@ def run_training(
         "checkpoint_path": str(best_checkpoint),
         "test_eval_error": test_eval_error,
     }
+    del model, optimizer, scheduler, criterion, dataloaders
+    release_gpu_memory()
+    return result
 
 
 def run_cross_validation(
@@ -1022,6 +1040,9 @@ def run_cross_validation(
                 f"  Fold {fold_idx + 1} | Best epoch: {best_epoch} | "
                 f"Val ROC-AUC: {roc_str} | Val {fold_train_config.primary_metric}: {primary_str}"
             )
+
+        del model, optimizer, scheduler, criterion, dataloaders, datasets
+        release_gpu_memory()
 
     # Aggregate fold validation metrics
     metric_keys = [k for k in fold_results[0]["best_val_metrics"] if isinstance(fold_results[0]["best_val_metrics"][k], (int, float))]

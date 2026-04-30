@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 import optuna
 
-from Model.engine import run_cross_validation, run_training, save_json, make_json_safe
+from Model.engine import release_gpu_memory, run_cross_validation, run_training, save_json, make_json_safe
 from Utils.config import AugmentationConfig, DataConfig, ModelConfig, SearchConfig, TrainConfig, to_serializable
 
 
@@ -150,6 +150,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Force augmentations on for every trial (skip the on/off categorical and only search augmentation strength).",
     )
+    parser.add_argument(
+        "--force-amp",
+        action="store_true",
+        help="Force AMP (mixed precision) on for every trial; skips the amp on/off categorical.",
+    )
     return parser.parse_args()
 
 
@@ -163,6 +168,7 @@ def _sample_trial_configs(
     batch_size_choices: list[int] | None = None,
     architecture: str = "resnet3d",
     force_augmentation: bool = False,
+    force_amp: bool = False,
 ) -> tuple[DataConfig, AugmentationConfig, ModelConfig, TrainConfig]:
     target_edge = trial.suggest_categorical("target_edge", [48, 64, 80])
     flip_axes_choice = trial.suggest_categorical("flip_axes", list(_FLIP_AXIS_CHOICES))
@@ -386,7 +392,7 @@ def _sample_trial_configs(
         # Tighter clip bounds — 5.0 was too loose and allowed the loss spike at epoch 2.
         gradient_clip_norm=trial.suggest_categorical("gradient_clip_norm", [0.25, 0.5, 1.0, 2.0]),
         use_weighted_sampler=use_weighted_sampler,
-        amp=trial.suggest_categorical("amp", [True, False]),
+        amp=True if force_amp else trial.suggest_categorical("amp", [True, False]),
         threshold_selection=threshold_selection,
         threshold_fbeta=threshold_fbeta,
         calibration_method=trial.suggest_categorical(
@@ -606,6 +612,7 @@ def main() -> None:
             batch_size_choices=args.batch_size_choices,
             architecture=args.architecture,
             force_augmentation=args.force_augmentation,
+            force_amp=args.force_amp,
         )
         use_cv = args.n_folds > 1
         try:
@@ -629,6 +636,7 @@ def main() -> None:
                 )
         except Exception as exc:
             print(f"  Trial {trial.number} failed: {exc}")
+            release_gpu_memory()
             raise optuna.TrialPruned() from exc
 
         if use_cv:
@@ -643,6 +651,7 @@ def main() -> None:
             ]
             if not fold_scores:
                 # All folds returned NaN for the primary metric — treat as failure.
+                release_gpu_memory()
                 raise optuna.TrialPruned("All folds returned NaN for primary metric.")
             score = float(sum(fold_scores) / len(fold_scores))
             agg = cv_results.get("aggregated_val_metrics", {})
@@ -694,6 +703,7 @@ def main() -> None:
         leaderboard.append(trial_summary)
         leaderboard_path.write_text(json.dumps(make_json_safe(leaderboard), indent=2))
         print(f"  Trial {trial.number:03d} score = {score:.4f}")
+        release_gpu_memory()
         return score
 
     completed_trials = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
