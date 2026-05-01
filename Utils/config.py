@@ -8,6 +8,7 @@ from typing import Any
 _VALID_NAN_STRATEGIES = frozenset(
     {"none", "drop_record", "fill_zero", "fill_mean", "fill_median", "fill_constant"}
 )
+_VALID_CACHE_MODES = frozenset({"none", "memory", "disk"})
 
 
 def _to_tuple3(values: tuple[int, int, int] | list[int] | int) -> tuple[int, int, int]:
@@ -35,12 +36,19 @@ class DataConfig:
     right_flip_axis: int = 0
     nan_strategy: str = "none"
     nan_fill_value: float = 0.0
+    cache_mode: str = "none"
+    cache_dir: Path = Path("outputs/preprocessed_cache")
 
     def __post_init__(self) -> None:
         if self.nan_strategy not in _VALID_NAN_STRATEGIES:
             raise ValueError(
                 f"Invalid nan_strategy '{self.nan_strategy}'. "
                 f"Must be one of {sorted(_VALID_NAN_STRATEGIES)}"
+            )
+        if self.cache_mode not in _VALID_CACHE_MODES:
+            raise ValueError(
+                f"Invalid cache_mode '{self.cache_mode}'. "
+                f"Must be one of {sorted(_VALID_CACHE_MODES)}"
             )
 
     def resolved(self) -> "DataConfig":
@@ -60,6 +68,8 @@ class DataConfig:
             right_flip_axis=int(self.right_flip_axis),
             nan_strategy=self.nan_strategy,
             nan_fill_value=float(self.nan_fill_value),
+            cache_mode=self.cache_mode,
+            cache_dir=Path(self.cache_dir),
         )
 
 

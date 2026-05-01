@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import os
 
-# Cap BLAS thread pools before numpy/torch are imported. Windows OpenBLAS can
-# raise "Memory allocation still failed after 10 retries" under bursts of
-# many short-lived BLAS calls (bootstrap CI + sklearn metrics); a single
-# thread avoids the contention without measurably slowing down our sizes.
-for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
-    os.environ.setdefault(_var, "1")
+# Cap BLAS thread pools before numpy/torch are imported on Windows only.
+# OpenBLAS there can fail under bursts of many short-lived sklearn metrics;
+# on Unix/macOS this cap can unnecessarily slow CPU preprocessing.
+if os.name == "nt":
+    for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(_var, "1")
 
 import argparse
 import json
@@ -113,6 +113,14 @@ def parse_args() -> argparse.Namespace:
         help="Optuna batch_size search space. If omitted, defaults to [8,16,24,32]. "
              "Pass a single value (e.g. --batch-size-choices 48) to fix batch size.",
     )
+    parser.add_argument(
+        "--target-edge-choices",
+        type=int,
+        nargs="+",
+        default=[48, 64, 80],
+        help="Optuna target edge search space. Pass one value (e.g. --target-edge-choices 64) "
+             "to avoid expensive 80^3 trials.",
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
@@ -163,6 +171,14 @@ def parse_args() -> argparse.Namespace:
                         choices=["none", "drop_record", "fill_zero", "fill_mean", "fill_median", "fill_constant"],
                         default="none")
     parser.add_argument("--nan-fill-value", type=float, default=0.0)
+    parser.add_argument("--cache-mode", choices=["none", "memory", "disk"], default="none",
+                        help="Cache deterministic preprocessing before augmentation. "
+                             "'disk' is best for repeated Optuna trials; 'memory' is fastest "
+                             "but keeps tensors in RAM per DataLoader process.")
+    parser.add_argument("--cache-dir", type=Path, default=Path("outputs/preprocessed_cache"),
+                        help="Directory for --cache-mode disk.")
+    parser.add_argument("--disable-pruning", action="store_true",
+                        help="Disable Optuna MedianPruner. By default bad trials can stop early.")
     parser.add_argument(
         "--force-augmentation",
         action="store_true",
@@ -187,8 +203,10 @@ def _sample_trial_configs(
     architecture: str = "resnet3d",
     force_augmentation: bool = False,
     force_amp: bool = False,
+    target_edge_choices: list[int] | None = None,
 ) -> tuple[DataConfig, AugmentationConfig, ModelConfig, TrainConfig]:
-    target_edge = trial.suggest_categorical("target_edge", [48, 64, 80])
+    target_edges = sorted({int(edge) for edge in (target_edge_choices or [48, 64, 80])})
+    target_edge = trial.suggest_categorical("target_edge", target_edges)
     flip_axes_choice = trial.suggest_categorical("flip_axes", list(_FLIP_AXIS_CHOICES))
     use_tabular_features = (
         trial.suggest_categorical("use_tabular_features", [True, False])
@@ -574,6 +592,8 @@ def main() -> None:
         summary_json=args.summary_json,
         nan_strategy=args.nan_strategy,
         nan_fill_value=args.nan_fill_value,
+        cache_mode=args.cache_mode,
+        cache_dir=args.cache_dir,
     )
     base_aug = AugmentationConfig(flip_axes=tuple(args.flip_axes))
     base_model = ModelConfig(
@@ -613,9 +633,19 @@ def main() -> None:
     storage_url = f"sqlite:///{storage_path}"
 
     sampler = optuna.samplers.TPESampler(seed=search_config.sampler_seed)
+    pruner = (
+        optuna.pruners.NopPruner()
+        if args.disable_pruning
+        else optuna.pruners.MedianPruner(
+            n_startup_trials=3,
+            n_warmup_steps=2 if args.n_folds > 1 else max(1, args.epochs // 3),
+            interval_steps=1,
+        )
+    )
     study = optuna.create_study(
         direction="maximize",
         sampler=sampler,
+        pruner=pruner,
         study_name=search_config.study_name,
         storage=storage_url,
         load_if_exists=True,
@@ -636,6 +666,7 @@ def main() -> None:
             architecture=args.architecture,
             force_augmentation=args.force_augmentation,
             force_amp=args.force_amp,
+            target_edge_choices=args.target_edge_choices,
         )
         use_cv = args.n_folds > 1
         try:
@@ -647,6 +678,7 @@ def main() -> None:
                     train_config=train_cfg,
                     n_folds=args.n_folds,
                     quiet=False,
+                    trial=trial,
                 )
             else:
                 results = run_training(
@@ -656,7 +688,11 @@ def main() -> None:
                     train_config=train_cfg,
                     quiet=False,
                     skip_test=True,
+                    trial=trial,
                 )
+        except optuna.TrialPruned:
+            release_gpu_memory()
+            raise
         except Exception as exc:
             print(f"  Trial {trial.number} failed: {exc}")
             release_gpu_memory()

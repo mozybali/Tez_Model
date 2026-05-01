@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import inspect
+import json
+import os
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +15,10 @@ import torch.nn.functional as torch_functional
 from torch.utils.data import Dataset
 
 from Preprocessing.analyze_dataset import ensure_metadata
+
+
+_VALID_CACHE_MODES = {"none", "memory", "disk"}
+_PREPROCESS_CACHE_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +157,8 @@ class AlanKidneyDataset(Dataset):
         right_flip_axis: int = 0,
         nan_strategy: str = "none",
         nan_fill_value: float = 0.0,
+        cache_mode: str = "none",
+        cache_dir: Path | None = None,
         transform=None,
     ) -> None:
         self.records = records
@@ -159,12 +170,78 @@ class AlanKidneyDataset(Dataset):
         self.right_flip_axis = int(right_flip_axis)
         self.nan_strategy = nan_strategy
         self.nan_fill_value = nan_fill_value
+        if cache_mode not in _VALID_CACHE_MODES:
+            raise ValueError(
+                f"Invalid cache_mode '{cache_mode}'. Must be one of {sorted(_VALID_CACHE_MODES)}."
+            )
+        self.cache_mode = cache_mode
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else Path("outputs/preprocessed_cache")
+        self._memory_cache: dict[str, torch.Tensor] = {}
         self.transform = transform
 
     def __len__(self) -> int:
         return len(self.records)
 
-    def _preprocess(self, record: AlanRecord) -> torch.Tensor:
+    def _cache_key(self, record: AlanRecord) -> str:
+        try:
+            stat = record.volume_path.stat()
+            volume_signature = {
+                "path": str(record.volume_path.resolve()),
+                "mtime_ns": stat.st_mtime_ns,
+                "size": stat.st_size,
+            }
+        except FileNotFoundError:
+            volume_signature = {"path": str(record.volume_path), "missing": True}
+
+        payload = {
+            "version": _PREPROCESS_CACHE_VERSION,
+            "preprocess_fingerprint": _preprocess_cache_fingerprint(),
+            "roi_id": record.roi_id,
+            "volume": volume_signature,
+            "target_shape": self.target_shape,
+            "use_bbox_crop": self.use_bbox_crop,
+            "bbox_margin": self.bbox_margin,
+            "pad_to_cube_input": self.pad_to_cube_input,
+            "canonicalize_right": self.canonicalize_right,
+            "right_flip_axis": self.right_flip_axis,
+            "nan_strategy": self.nan_strategy,
+            "nan_fill_value": self.nan_fill_value,
+            "bbox_min": record.bbox_min,
+            "bbox_max": record.bbox_max,
+            "side": record.side,
+        }
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha1(raw).hexdigest()
+
+    def _cache_path(self, key: str) -> Path:
+        return self.cache_dir / f"{key}.npy"
+
+    def _load_disk_cache(self, key: str) -> torch.Tensor | None:
+        path = self._cache_path(key)
+        if not path.exists():
+            return None
+        array = np.load(path)
+        return torch.from_numpy(array.astype(np.float32, copy=False))
+
+    def _save_disk_cache(self, key: str, tensor: torch.Tensor) -> None:
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        path = self._cache_path(key)
+        if path.exists():
+            return
+        tmp_path = path.with_name(f"{path.stem}.{os.getpid()}.{id(self)}.tmp.npy")
+        try:
+            np.save(tmp_path, tensor.detach().cpu().numpy().astype(np.float32, copy=False))
+            os.replace(tmp_path, path)
+        except OSError:
+            if path.exists():
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return
+            raise
+
+    def _preprocess_uncached(self, record: AlanRecord) -> torch.Tensor:
         volume = np.load(record.volume_path).astype(np.float32, copy=False)
         volume = apply_nan_strategy(volume, self.nan_strategy, self.nan_fill_value)
         if self.use_bbox_crop:
@@ -179,9 +256,36 @@ class AlanKidneyDataset(Dataset):
         if self.pad_to_cube_input:
             volume = pad_to_cube(volume)
         tensor = resize_volume(volume, self.target_shape)
+        return tensor.clamp_(0.0, 1.0)
+
+    def _preprocess_base(self, record: AlanRecord) -> torch.Tensor:
+        if self.cache_mode == "none":
+            return self._preprocess_uncached(record)
+
+        key = self._cache_key(record)
+        if self.cache_mode == "memory":
+            cached = self._memory_cache.get(key)
+            if cached is None:
+                cached = self._preprocess_uncached(record)
+                self._memory_cache[key] = cached
+            return cached
+
+        cached = self._load_disk_cache(key)
+        if cached is not None:
+            return cached
+
+        tensor = self._preprocess_uncached(record)
+        self._save_disk_cache(key, tensor)
+        return tensor
+
+    def _preprocess(self, record: AlanRecord) -> torch.Tensor:
+        tensor = self._preprocess_base(record)
+        if self.cache_mode == "memory" or self.transform is not None:
+            tensor = tensor.clone()
         if self.transform is not None:
             tensor = self.transform(tensor)
-        return tensor.clamp_(0.0, 1.0)
+            tensor = tensor.clamp_(0.0, 1.0)
+        return tensor
 
     def __getitem__(self, index: int) -> dict[str, object]:
         record = self.records[index]
@@ -195,3 +299,21 @@ class AlanKidneyDataset(Dataset):
             "voxel_count": torch.tensor(record.voxel_count, dtype=torch.float32),
         }
 
+
+@lru_cache(maxsize=1)
+def _preprocess_cache_fingerprint() -> str:
+    objects = (
+        apply_nan_strategy,
+        crop_to_bbox,
+        pad_to_cube,
+        resize_volume,
+        AlanKidneyDataset._preprocess_uncached,
+    )
+    sources = []
+    for obj in objects:
+        try:
+            sources.append(inspect.getsource(obj))
+        except (OSError, TypeError):
+            sources.append(repr(obj))
+    raw = "\n".join(sources).encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()

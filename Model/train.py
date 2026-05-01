@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import os
 
-# Cap BLAS thread pools before numpy/torch are imported. Windows OpenBLAS can
-# raise "Memory allocation still failed after 10 retries" under bursts of
-# many short-lived BLAS calls (bootstrap CI + sklearn metrics); a single
-# thread avoids the contention without measurably slowing down our sizes.
-for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
-    os.environ.setdefault(_var, "1")
+# Cap BLAS thread pools before numpy/torch are imported on Windows only.
+# OpenBLAS there can fail under bursts of many short-lived sklearn metrics;
+# on Unix/macOS this cap can unnecessarily slow CPU preprocessing.
+if os.name == "nt":
+    for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(_var, "1")
 
 import argparse
 import json
@@ -123,6 +123,12 @@ def parse_args() -> argparse.Namespace:
                         choices=["none", "drop_record", "fill_zero", "fill_mean", "fill_median", "fill_constant"],
                         default="none")
     parser.add_argument("--nan-fill-value", type=float, default=0.0)
+    parser.add_argument("--cache-mode", choices=["none", "memory", "disk"], default="none",
+                        help="Cache deterministic preprocessing before augmentation. "
+                             "'disk' is best for repeated Optuna/training runs; 'memory' is fastest "
+                             "but keeps tensors in RAM per DataLoader process.")
+    parser.add_argument("--cache-dir", type=Path, default=Path("outputs/preprocessed_cache"),
+                        help="Directory for --cache-mode disk.")
     parser.add_argument("--warmup-epochs", type=int, default=3,
                         help="Number of linear warmup epochs before the main scheduler kicks in.")
     parser.add_argument("--pos-weight-strategy",
@@ -154,6 +160,8 @@ def main() -> None:
         right_flip_axis=args.right_flip_axis,
         nan_strategy=args.nan_strategy,
         nan_fill_value=args.nan_fill_value,
+        cache_mode=args.cache_mode,
+        cache_dir=args.cache_dir,
     )
     augmentation_config = AugmentationConfig(
         enabled=not args.disable_augmentations,

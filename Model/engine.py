@@ -27,7 +27,6 @@ from Utils.calibration import (
 )
 from Utils.config import AugmentationConfig, DataConfig, ModelConfig, TrainConfig, to_serializable
 from Utils.metrics import bootstrap_confidence_intervals, compute_binary_classification_metrics, optimize_threshold, select_model_score
-from Utils.plot_metrics import generate_plots
 from Utils.reproducibility import seed_everything
 
 
@@ -45,6 +44,14 @@ def release_gpu_memory() -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+
+
+def _raise_trial_pruned(message: str) -> None:
+    try:
+        import optuna
+    except ImportError as exc:
+        raise RuntimeError("Optuna pruning requested but optuna is not installed.") from exc
+    raise optuna.TrialPruned(message)
 
 
 def resolve_device(device_name: str) -> torch.device:
@@ -184,6 +191,8 @@ def build_dataloaders(
         right_flip_axis=data_config.right_flip_axis,
         nan_strategy=data_config.nan_strategy if data_config.nan_strategy != "drop_record" else "none",
         nan_fill_value=data_config.nan_fill_value,
+        cache_mode=data_config.cache_mode,
+        cache_dir=data_config.cache_dir,
     )
     datasets = {
         "train": AlanKidneyDataset(records=splits["train"], transform=train_transform, **common_kwargs),
@@ -358,7 +367,7 @@ def _run_epoch_raw(
     y_true: list[float] = []
     y_prob: list[float] = []
 
-    grad_context = nullcontext() if is_training else torch.no_grad()
+    grad_context = nullcontext() if is_training else torch.inference_mode()
     with grad_context:
         for batch in dataloader:
             volumes = batch["volume"].to(device, non_blocking=True)
@@ -446,7 +455,7 @@ def collect_predictions(
     y_prob: list[float] = []
     y_logit: list[float] = []
     flip_dims_list = _TTA_FLIP_DIMS if tta_enabled else ((),)
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch in dataloader:
             volumes = batch["volume"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True)
@@ -476,6 +485,7 @@ def run_training(
     train_config: TrainConfig,
     quiet: bool = False,
     skip_test: bool = False,
+    trial: object | None = None,
 ) -> dict[str, object]:
     data_config = data_config.resolved()
     output_dir = train_config.output_dir
@@ -559,6 +569,12 @@ def run_training(
         )
         val_metrics["loss"] = val_loss
         score = select_model_score(val_metrics, primary_metric=train_config.primary_metric)
+        if trial is not None:
+            trial.report(float(score), step=epoch)
+            if trial.should_prune():
+                del model, optimizer, scheduler, criterion, dataloaders
+                release_gpu_memory()
+                _raise_trial_pruned(f"Pruned at epoch {epoch} with score={score:.4f}.")
 
         entry = {"epoch": epoch, "train": train_metrics, "val": val_metrics, "score": score}
         history.append(entry)
@@ -863,6 +879,8 @@ def run_training(
     history_path = output_dir / "history.json"
     if history_path.exists():
         try:
+            from Utils.plot_metrics import generate_plots
+
             generate_plots(history_path, out_dir=output_dir)
         except Exception as exc:
             if not quiet:
@@ -894,6 +912,7 @@ def run_cross_validation(
     train_config: TrainConfig,
     n_folds: int = 5,
     quiet: bool = False,
+    trial: object | None = None,
 ) -> dict[str, object]:
     """Run k-fold cross-validation and aggregate results."""
     from sklearn.model_selection import StratifiedGroupKFold
@@ -965,6 +984,8 @@ def run_cross_validation(
             right_flip_axis=data_config.right_flip_axis,
             nan_strategy=data_config.nan_strategy if data_config.nan_strategy != "drop_record" else "none",
             nan_fill_value=data_config.nan_fill_value,
+            cache_mode=data_config.cache_mode,
+            cache_dir=data_config.cache_dir,
         )
 
         from Preprocessing.dataset import AlanKidneyDataset
@@ -1078,6 +1099,27 @@ def run_cross_validation(
         fold_results.append(fold_result)
         save_json(fold_result, fold_dir / "fold_result.json")
 
+        prune_message = None
+        if trial is not None:
+            primary = train_config.primary_metric
+            running_scores = [
+                fr["best_val_metrics"].get(primary)
+                for fr in fold_results
+            ]
+            running_scores = [
+                float(score) for score in running_scores
+                if score is not None and not (isinstance(score, float) and math.isnan(score))
+            ]
+            if running_scores:
+                running_mean = float(np.mean(running_scores))
+                running_std = float(np.std(running_scores)) if len(running_scores) > 1 else 0.0
+                penalty = float(getattr(train_config, "cv_score_std_penalty", 0.0) or 0.0)
+                trial.report(running_mean - penalty * running_std, step=fold_idx + 1)
+                if trial.should_prune():
+                    prune_message = (
+                        f"Pruned after fold {fold_idx + 1} with running_mean={running_mean:.4f}."
+                    )
+
         if not quiet:
             roc = best_val_metrics.get("roc_auc")
             roc_str = f"{roc:.4f}" if roc is not None and not math.isnan(roc) else "N/A"
@@ -1094,6 +1136,8 @@ def run_cross_validation(
 
         del model, optimizer, scheduler, criterion, dataloaders, datasets
         release_gpu_memory()
+        if prune_message is not None:
+            _raise_trial_pruned(prune_message)
 
     # Aggregate fold validation metrics
     metric_keys = [k for k in fold_results[0]["best_val_metrics"] if isinstance(fold_results[0]["best_val_metrics"][k], (int, float))]

@@ -143,6 +143,17 @@ Desteklenen NaN stratejileri:
 
 Varsayılan hedef boyut `64 x 64 x 64` olarak ayarlanmıştır. Sağ böbreği kanonikleştirme (`--canonicalize-right`) varsayılan olarak kapalıdır.
 
+Ön işleme her epoch'ta tekrar çalıştığı için uzun eğitimlerde veya Optuna aramalarında cache açmak süreyi ciddi azaltabilir:
+
+```bash
+python -m Model.train \
+  --cache-mode disk \
+  --cache-dir outputs/preprocessed_cache \
+  --num-workers 4
+```
+
+`disk` modu ilk geçişte deterministik crop/pad/resize sonuçlarını yazar, sonraki epoch/trial'larda bunları tekrar kullanır. Büyük datasetler ve `num_workers > 0` için önerilen mod budur. `memory` modu tek çalıştırmada daha hızlıdır ama tensorleri RAM'de ve her DataLoader worker sürecinde ayrı tutar; bu yüzden yalnızca küçük datasetlerde veya tercihen `--num-workers 0` ile kullanılmalıdır.
+
 ## Model
 
 Proje üç farklı 3B omurga mimarisini destekler ve `--architecture` argümanı ile seçilir:
@@ -277,6 +288,8 @@ python -m Model.search \
   --n-trials 30 \
   --epochs 12 \
   --device auto \
+  --cache-mode disk \
+  --num-workers 4 \
   --output-dir outputs/optuna \
   --final-epochs 20
 ```
@@ -292,8 +305,12 @@ python -m Model.search \
   --n-trials 30 \
   --epochs 12 \
   --device auto \
+  --cache-mode disk \
+  --target-edge-choices 48 64 \
   --output-dir outputs/optuna_with_pointnet
 ```
+
+Varsayılan aramada Optuna `MedianPruner` kötü giden trial'ları erken kesebilir. Tam eski davranış istenirse `--disable-pruning` kullanılabilir; en pahalı hacim boyutunu dışarıda bırakmak için `--target-edge-choices 48 64`, tamamen sabitlemek için `--target-edge-choices 64` verilebilir.
 
 Optuna çıktıları:
 
