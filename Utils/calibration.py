@@ -160,8 +160,15 @@ def select_threshold_bootstrap(
     n_bootstrap: int = 200,
     seed: int = 42,
     beta: float = 1.0,
+    min_specificity: float | None = None,
+    min_precision: float | None = None,
 ) -> float:
-    """Bootstrap-averaged threshold selection — more stable than a single split."""
+    """Bootstrap-averaged threshold selection — more stable than a single split.
+
+    ``min_specificity`` / ``min_precision`` are forwarded to ``optimize_threshold``
+    on every bootstrap resample so a recall-only objective cannot pick the
+    threshold-collapses-to-0.05 corner.
+    """
     from Utils.metrics import optimize_threshold
 
     y_true_arr = np.asarray(y_true, dtype=np.int64).reshape(-1)
@@ -179,11 +186,17 @@ def select_threshold_bootstrap(
         if len(np.unique(bt_true)) < 2:
             continue
         thresholds.append(
-            optimize_threshold(bt_true.tolist(), bt_prob.tolist(), method=method, beta=beta)
+            optimize_threshold(
+                bt_true.tolist(), bt_prob.tolist(),
+                method=method, beta=beta,
+                min_specificity=min_specificity, min_precision=min_precision,
+            )
         )
     if not thresholds:
         return optimize_threshold(
-            y_true_arr.tolist(), y_prob_arr.tolist(), method=method, beta=beta,
+            y_true_arr.tolist(), y_prob_arr.tolist(),
+            method=method, beta=beta,
+            min_specificity=min_specificity, min_precision=min_precision,
         )
     return float(np.median(thresholds))
 

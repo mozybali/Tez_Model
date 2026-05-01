@@ -81,6 +81,18 @@ def parse_args() -> argparse.Namespace:
                         help="How to pick the decision threshold on the validation set.")
     parser.add_argument("--threshold-fbeta", type=float, default=1.0,
                         help="Beta for fbeta threshold selection (>1 weights recall).")
+    parser.add_argument("--threshold-min-specificity", type=float, default=None,
+                        help="Floor on val specificity when picking the F-beta threshold. "
+                             "Without this, β>1 will pick threshold≈0.05 on small val sets.")
+    parser.add_argument("--threshold-min-precision", type=float, default=None,
+                        help="Floor on val precision for F-beta threshold selection.")
+    parser.add_argument("--constrained-f1-min-specificity", type=float, default=0.80,
+                        help="Specificity floor used when --primary-metric=constrained_f1. "
+                             "F1 collapses to 0 below this on any val/fold so checkpoint selection "
+                             "cannot reward models that just spam positives.")
+    parser.add_argument("--isotonic-min-samples", type=int, default=150,
+                        help="Skip isotonic calibration when val n is below this. "
+                             "Pass 0 to restore the legacy always-on isotonic behavior.")
     parser.add_argument("--calibration-method",
                         choices=["temperature", "isotonic", "temperature+isotonic"],
                         default="temperature",
@@ -102,9 +114,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--affine-probability", type=float, default=0.6)
     parser.add_argument("--morphology-probability", type=float, default=0.1)
     parser.add_argument("--primary-metric",
-                        choices=["roc_auc", "pr_auc", "balanced_accuracy", "f1"],
+                        choices=["roc_auc", "pr_auc", "balanced_accuracy", "f1", "mcc", "constrained_f1"],
                         default="pr_auc",
-                        help="Metric to maximize (fallback chain: pr_auc → balanced_accuracy → f1).")
+                        help="Metric to maximize (fallback chain: pr_auc → balanced_accuracy → f1). "
+                             "'mcc' / 'constrained_f1' guard against the recall-greedy collapse where "
+                             "checkpoint selection rewards a model that spams positives.")
     parser.add_argument("--nan-strategy",
                         choices=["none", "drop_record", "fill_zero", "fill_mean", "fill_median", "fill_constant"],
                         default="none")
@@ -200,6 +214,10 @@ def main() -> None:
         calibrate_temperature=not args.disable_calibration,
         threshold_selection=args.threshold_selection,
         threshold_fbeta=args.threshold_fbeta,
+        threshold_min_specificity=args.threshold_min_specificity,
+        threshold_min_precision=args.threshold_min_precision,
+        constrained_f1_min_specificity=args.constrained_f1_min_specificity,
+        isotonic_min_samples=args.isotonic_min_samples,
         calibration_method=args.calibration_method,
         tta_enabled=args.tta,
     )

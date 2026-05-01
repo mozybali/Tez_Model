@@ -138,9 +138,27 @@ def parse_args() -> argparse.Namespace:
                              "Overrides the best trial's sampled patience so a longer final budget "
                              "(--final-epochs) isn't cut short. Defaults to the best trial's patience.")
     parser.add_argument("--primary-metric",
-                        choices=["roc_auc", "pr_auc", "balanced_accuracy", "f1"],
+                        choices=["roc_auc", "pr_auc", "balanced_accuracy", "f1", "mcc", "constrained_f1"],
                         default="roc_auc",
-                        help="Metric to maximize (fallback chain: pr_auc → balanced_accuracy → f1).")
+                        help="Metric to maximize (fallback chain: pr_auc → balanced_accuracy → f1). "
+                             "'mcc' and 'constrained_f1' guard against the recall-greedy collapse where "
+                             "a fold picks threshold≈0.05 and reports high F1/PR-AUC at near-zero specificity.")
+    parser.add_argument("--threshold-min-specificity", type=float, default=None,
+                        help="Floor on val specificity when picking the F-beta threshold. "
+                             "Without this, β>1 will pick threshold≈0.05 on small val sets.")
+    parser.add_argument("--threshold-min-precision", type=float, default=None,
+                        help="Floor on val precision for F-beta threshold selection.")
+    parser.add_argument("--constrained-f1-min-specificity", type=float, default=0.80,
+                        help="Specificity floor used when primary-metric=constrained_f1. "
+                             "F1 collapses to 0 below this on any val/fold so HPO cannot reward "
+                             "models that just spam positives.")
+    parser.add_argument("--isotonic-min-samples", type=int, default=150,
+                        help="Skip isotonic calibration when val n is below this. "
+                             "Isotonic on tiny vals (<~150) overfits ECE to 0 and turns "
+                             "calibrated probs into a coarse staircase.")
+    parser.add_argument("--cv-score-std-penalty", type=float, default=0.0,
+                        help="Penalize fold disagreement: HPO score = mean − penalty * std "
+                             "of the primary metric across folds. 0.0 = legacy mean-only.")
     parser.add_argument("--nan-strategy",
                         choices=["none", "drop_record", "fill_zero", "fill_mean", "fill_median", "fill_constant"],
                         default="none")
@@ -575,6 +593,11 @@ def main() -> None:
         primary_metric=args.primary_metric,
         decision_threshold=args.decision_threshold,
         amp=not args.disable_amp,
+        threshold_min_specificity=args.threshold_min_specificity,
+        threshold_min_precision=args.threshold_min_precision,
+        constrained_f1_min_specificity=args.constrained_f1_min_specificity,
+        isotonic_min_samples=args.isotonic_min_samples,
+        cv_score_std_penalty=args.cv_score_std_penalty,
     )
 
     root_dir = Path(search_config.output_dir)
@@ -653,10 +676,20 @@ def main() -> None:
                 # All folds returned NaN for the primary metric — treat as failure.
                 release_gpu_memory()
                 raise optuna.TrialPruned("All folds returned NaN for primary metric.")
-            score = float(sum(fold_scores) / len(fold_scores))
+            cv_mean = float(sum(fold_scores) / len(fold_scores))
+            cv_std = float(np.std(fold_scores)) if len(fold_scores) > 1 else 0.0
+            penalty = float(getattr(train_cfg, "cv_score_std_penalty", 0.0) or 0.0)
+            # score = mean − penalty * std penalizes trials whose folds disagree.
+            # On the run where trial_15 won, fold_03 collapsed (threshold≈0.05,
+            # MCC=0); a non-zero penalty would have pushed the picker toward a
+            # trial whose folds agree, even at slightly lower mean PR-AUC.
+            score = cv_mean - penalty * cv_std
             agg = cv_results.get("aggregated_val_metrics", {})
             output_dir_str = str(train_cfg.output_dir)
             trial.set_user_attr("cv_fold_scores", fold_scores)
+            trial.set_user_attr("cv_score_mean", cv_mean)
+            trial.set_user_attr("cv_score_std", cv_std)
+            trial.set_user_attr("cv_score_std_penalty", penalty)
             trial.set_user_attr("aggregated_val_metrics", agg)
             trial.set_user_attr("output_dir", output_dir_str)
 
@@ -675,10 +708,9 @@ def main() -> None:
                 "best_epoch": best_epochs,
                 "n_folds": args.n_folds,
                 "cv_fold_scores": fold_scores,
-                "cv_score_mean": _nan_safe(score),
-                "cv_score_std": _nan_safe(
-                    float(np.std(fold_scores)) if len(fold_scores) > 1 else 0.0
-                ),
+                "cv_score_mean": _nan_safe(cv_mean),
+                "cv_score_std": _nan_safe(cv_std),
+                "cv_score_std_penalty": penalty,
                 "best_val_metrics": {k: _nan_safe(v) for k, v in mean_val_metrics.items()},
                 "fold_results": cv_results["fold_results"],
             }

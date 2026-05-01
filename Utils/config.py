@@ -132,7 +132,26 @@ class TrainConfig:
     calibrate_temperature: bool = True
     threshold_selection: str = "youden"  # "youden", "f1", "fbeta", or "fixed"
     threshold_fbeta: float = 1.0  # used when threshold_selection == "fbeta"; >1 favors recall
+    # Operational guardrails for fbeta/f1 threshold selection. When set, only
+    # thresholds whose val-set specificity/precision meet these floors are
+    # eligible — protects against the recall-greedy collapse where β>1 picks a
+    # threshold near 0.05 that flags almost every kidney as anomaly.
+    threshold_min_specificity: float | None = None
+    threshold_min_precision: float | None = None
     calibration_method: str = "temperature"  # "temperature", "isotonic", or "temperature+isotonic"
+    # Skip isotonic fit when the validation split has fewer than this many samples.
+    # Isotonic on tiny vals (<~150) collapses ECE to ~0 by overfitting and
+    # turns calibrated probs into a coarse staircase (≤ ~30 unique values),
+    # which makes downstream threshold selection brittle.
+    isotonic_min_samples: int = 150
+    # When primary_metric == "constrained_f1", F1 is only counted if val
+    # specificity >= this floor; otherwise the score collapses to 0 so HPO
+    # cannot pick a fold/trial that achieves high F1 by spamming positives.
+    constrained_f1_min_specificity: float = 0.80
+    # CV score = mean(primary) − cv_score_std_penalty * std(primary).
+    # 0.0 reproduces the legacy mean-only objective; 0.5–1.0 penalizes trials
+    # whose folds disagree strongly (e.g. one fold collapses to threshold≈0.05).
+    cv_score_std_penalty: float = 0.0
     tta_enabled: bool = False  # flip-based test-time augmentation during collect_predictions
 
 

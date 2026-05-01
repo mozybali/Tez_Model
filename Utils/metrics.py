@@ -26,6 +26,7 @@ def compute_binary_classification_metrics(
     y_true: list[float] | np.ndarray,
     y_prob: list[float] | np.ndarray,
     threshold: float = 0.5,
+    constrained_f1_min_specificity: float | None = None,
 ) -> dict[str, float]:
     """Compute the full binary-classification metric bundle used across the project.
 
@@ -125,6 +126,16 @@ def compute_binary_classification_metrics(
     metrics["fp"] = float(fp)
     metrics["fn"] = float(fn)
     metrics["tp"] = float(tp)
+
+    # constrained_f1: F1 if specificity meets the floor, else 0. Lets HPO use
+    # F1 as the objective without rewarding the recall-greedy collapse where
+    # a model spams positives to drive F1 up at near-zero specificity.
+    if constrained_f1_min_specificity is not None:
+        metrics["constrained_f1"] = (
+            float(metrics["f1"])
+            if specificity >= float(constrained_f1_min_specificity)
+            else 0.0
+        )
     return metrics
 
 
@@ -164,6 +175,8 @@ def optimize_threshold(
     y_prob: list[float] | np.ndarray,
     method: str = "youden",
     beta: float = 1.0,
+    min_specificity: float | None = None,
+    min_precision: float | None = None,
 ) -> float:
     """Find optimal classification threshold on a validation set.
 
@@ -171,6 +184,11 @@ def optimize_threshold(
         youden: Maximizes Youden's J statistic (sensitivity + specificity - 1).
         f1:     Maximizes F1 score over a grid of thresholds.
         fbeta:  Maximizes F_beta (beta>1 weights recall — useful for anomaly recall).
+
+    ``min_specificity`` / ``min_precision`` (only honored for f1/fbeta) restrict
+    the candidate set to thresholds whose specificity / precision on the
+    provided sample meet the floors. Without this, β>1 will happily pick
+    threshold≈0.05 (recall=1, specificity≈0.5) on small val sets.
     """
     from sklearn.metrics import roc_curve
 
@@ -191,16 +209,34 @@ def optimize_threshold(
         b2 = b * b
         best_score = -1.0
         best_thresh = 0.5
+        # Track unconstrained best as a fallback so we never return 0.5 just
+        # because no candidate cleared the floor (can happen on a single fold).
+        best_unconstrained_score = -1.0
+        best_unconstrained_thresh = 0.5
         for thresh in np.linspace(0.05, 0.95, 181):
             preds = (y_prob_arr >= thresh).astype(np.int64)
             tp = float(((preds == 1) & (y_true_arr == 1)).sum())
             fp = float(((preds == 1) & (y_true_arr == 0)).sum())
             fn = float(((preds == 0) & (y_true_arr == 1)).sum())
+            tn = float(((preds == 0) & (y_true_arr == 0)).sum())
             denom = (1.0 + b2) * tp + b2 * fn + fp
             score = ((1.0 + b2) * tp / denom) if denom > 0 else 0.0
+            if score > best_unconstrained_score:
+                best_unconstrained_score = score
+                best_unconstrained_thresh = float(thresh)
+            if min_specificity is not None:
+                spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+                if spec < float(min_specificity):
+                    continue
+            if min_precision is not None:
+                prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                if prec < float(min_precision):
+                    continue
             if score > best_score:
                 best_score = score
                 best_thresh = float(thresh)
+        if best_score < 0.0:
+            return best_unconstrained_thresh
         return best_thresh
 
     raise ValueError(f"Unsupported threshold optimization method: {method}")
@@ -253,6 +289,9 @@ def bootstrap_confidence_intervals(
 
 
 def select_model_score(metrics: dict[str, float], primary_metric: str = "roc_auc") -> float:
+    # Order matters: try the requested metric first, then fall back through
+    # general-purpose metrics. mcc/constrained_f1 are only consulted when the
+    # caller explicitly asks for them.
     candidates = [primary_metric, "pr_auc", "balanced_accuracy", "f1"]
     for key in candidates:
         value = metrics.get(key)

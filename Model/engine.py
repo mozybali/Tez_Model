@@ -511,6 +511,19 @@ def run_training(
     best_checkpoint = output_dir / "best_model.pt"
     patience_counter = 0
 
+    # Resolve threshold-selection knobs once so the per-epoch loop matches the
+    # CV fold loop. Without this, run_training's checkpoint selection used a
+    # hard-coded Youden threshold and never surfaced constrained_f1 — meaning
+    # --primary-metric constrained_f1 silently fell back to pr_auc and the
+    # selected best_model.pt could still be the "spam-positives" fold winner.
+    epoch_threshold_method = getattr(train_config, "threshold_selection", "youden")
+    epoch_threshold_beta = float(getattr(train_config, "threshold_fbeta", 1.0))
+    epoch_min_spec = getattr(train_config, "threshold_min_specificity", None)
+    epoch_min_prec = getattr(train_config, "threshold_min_precision", None)
+    epoch_constrained_f1_min_spec = getattr(
+        train_config, "constrained_f1_min_specificity", None,
+    )
+
     for epoch in range(1, train_config.epochs + 1):
         train_metrics = run_epoch(
             model=model,
@@ -532,9 +545,17 @@ def run_training(
             amp_enabled=False,
             tabular_feature_stats=tabular_feature_stats,
         )
-        val_threshold = optimize_threshold(val_y_true, val_y_prob, method="youden")
+        if epoch_threshold_method == "fixed":
+            val_threshold = float(train_config.decision_threshold)
+        else:
+            val_threshold = optimize_threshold(
+                val_y_true, val_y_prob,
+                method=epoch_threshold_method, beta=epoch_threshold_beta,
+                min_specificity=epoch_min_spec, min_precision=epoch_min_prec,
+            )
         val_metrics = compute_binary_classification_metrics(
             y_true=val_y_true, y_prob=val_y_prob, threshold=val_threshold,
+            constrained_f1_min_specificity=epoch_constrained_f1_min_spec,
         )
         val_metrics["loss"] = val_loss
         score = select_model_score(val_metrics, primary_metric=train_config.primary_metric)
@@ -638,6 +659,21 @@ def run_training(
     val_probs_after_temp = apply_temperature(val_logits_np, temperature)
 
     isotonic_result = None
+    isotonic_min_samples = int(getattr(train_config, "isotonic_min_samples", 0) or 0)
+    val_n = int(val_labels_np.shape[0])
+    if use_isotonic and val_n < isotonic_min_samples:
+        if not quiet:
+            print(
+                f"  Isotonic calibration skipped: val n={val_n} < "
+                f"isotonic_min_samples={isotonic_min_samples} "
+                f"(would overfit to a near-zero ECE on a tiny split)."
+            )
+        calibration_summary.update({
+            "isotonic_skipped_reason": (
+                f"val_n={val_n} < isotonic_min_samples={isotonic_min_samples}"
+            ),
+        })
+        use_isotonic = False
     if use_isotonic:
         isotonic_result = fit_isotonic(val_probs_after_temp, val_labels_np)
         calibration_summary.update({
@@ -656,6 +692,9 @@ def run_training(
     # ── Threshold selection: fixed, single-split, and bootstrap-median ──
     threshold_method = getattr(train_config, "threshold_selection", "youden")
     threshold_beta = float(getattr(train_config, "threshold_fbeta", 1.0))
+    threshold_min_spec = getattr(train_config, "threshold_min_specificity", None)
+    threshold_min_prec = getattr(train_config, "threshold_min_precision", None)
+    constrained_f1_min_spec = getattr(train_config, "constrained_f1_min_specificity", None)
     fixed_threshold = float(train_config.decision_threshold)
     if threshold_method == "fixed":
         optimal_threshold = fixed_threshold
@@ -663,6 +702,7 @@ def run_training(
         optimal_threshold = select_threshold_bootstrap(
             val_preds["y_true"], val_probs_cal.tolist(),
             method=threshold_method, seed=train_config.seed, beta=threshold_beta,
+            min_specificity=threshold_min_spec, min_precision=threshold_min_prec,
         )
     if not quiet:
         print(
@@ -673,9 +713,11 @@ def run_training(
     # Store val metrics at both thresholds (calibrated probabilities)
     val_metrics_fixed = compute_binary_classification_metrics(
         val_preds["y_true"], val_probs_cal.tolist(), threshold=fixed_threshold,
+        constrained_f1_min_specificity=constrained_f1_min_spec,
     )
     val_metrics_tuned = compute_binary_classification_metrics(
         val_preds["y_true"], val_probs_cal.tolist(), threshold=optimal_threshold,
+        constrained_f1_min_specificity=constrained_f1_min_spec,
     )
 
     # Reliability diagram data for plots
@@ -736,10 +778,12 @@ def run_training(
 
             test_metrics_fixed = compute_binary_classification_metrics(
                 test_preds["y_true"], test_probs_cal.tolist(), threshold=fixed_threshold,
+                constrained_f1_min_specificity=constrained_f1_min_spec,
             )
             test_metrics_fixed["loss"] = test_loss
             test_metrics = compute_binary_classification_metrics(
                 test_preds["y_true"], test_probs_cal.tolist(), threshold=optimal_threshold,
+                constrained_f1_min_specificity=constrained_f1_min_spec,
             )
             test_metrics["loss"] = test_loss
 
@@ -990,15 +1034,22 @@ def run_cross_validation(
             # run_training would deploy (e.g. fbeta when HPO optimizes F1).
             fold_threshold_method = getattr(fold_train_config, "threshold_selection", "youden")
             fold_threshold_beta = float(getattr(fold_train_config, "threshold_fbeta", 1.0))
+            fold_min_spec = getattr(fold_train_config, "threshold_min_specificity", None)
+            fold_min_prec = getattr(fold_train_config, "threshold_min_precision", None)
+            fold_constrained_f1_min_spec = getattr(
+                fold_train_config, "constrained_f1_min_specificity", None,
+            )
             if fold_threshold_method == "fixed":
                 val_threshold = float(fold_train_config.decision_threshold)
             else:
                 val_threshold = optimize_threshold(
                     val_y_true, val_y_prob,
                     method=fold_threshold_method, beta=fold_threshold_beta,
+                    min_specificity=fold_min_spec, min_precision=fold_min_prec,
                 )
             val_metrics = compute_binary_classification_metrics(
                 y_true=val_y_true, y_prob=val_y_prob, threshold=val_threshold,
+                constrained_f1_min_specificity=fold_constrained_f1_min_spec,
             )
             val_metrics["loss"] = val_loss
             score = select_model_score(val_metrics, primary_metric=fold_train_config.primary_metric)
