@@ -43,7 +43,7 @@ from Model.engine import (
     collect_predictions,
     resolve_device,
 )
-from Utils.calibration import apply_temperature, logits_from_probs
+from Utils.calibration import IsotonicResult, apply_isotonic, apply_temperature, logits_from_probs
 from Utils.config import AugmentationConfig, DataConfig, ModelConfig, TrainConfig
 from Utils.metrics import compute_binary_classification_metrics, compute_per_class_report
 
@@ -102,6 +102,22 @@ def obtain_predictions(
     temperature = float(cfg.get("temperature", 1.0))
     tuned_threshold = float(cfg.get("optimal_threshold", 0.5))
     fixed_threshold = float(cfg.get("fixed_threshold", 0.5))
+    calibration_path = run_dir / "calibration.json"
+    calibration_payload = json.loads(calibration_path.read_text()) if calibration_path.exists() else {}
+
+    def apply_saved_calibration(logits: np.ndarray) -> np.ndarray:
+        probs = apply_temperature(logits, temperature)
+        iso_x = calibration_payload.get("isotonic_x")
+        iso_y = calibration_payload.get("isotonic_y")
+        if iso_x and iso_y:
+            result = IsotonicResult(
+                x=tuple(float(v) for v in iso_x),
+                y=tuple(float(v) for v in iso_y),
+                ece_before=float("nan"),
+                ece_after=float("nan"),
+            )
+            probs = apply_isotonic(probs, result)
+        return probs
 
     saved_pred_path = run_dir / "test_predictions.json"
 
@@ -156,7 +172,7 @@ def obtain_predictions(
         y_true = np.asarray(preds["y_true"], dtype=np.float64)
         y_prob_raw = np.asarray(preds["y_prob"], dtype=np.float64)
         logits = np.asarray(preds.get("y_logit") or logits_from_probs(y_prob_raw))
-        y_prob_cal = apply_temperature(logits, temperature)
+        y_prob_cal = apply_saved_calibration(logits)
         source = "fresh inference (ZS-test)"
 
         fresh_payload = {
@@ -472,7 +488,7 @@ def interpretation(metrics_tuned: dict[str, Any], metrics_fixed: dict[str, Any],
     )
     lines.append(
         f"- At the fixed 0.5 threshold the {model_ref} scores F1-Anomaly = {metrics_fixed['f1_positive']:.4f} / "
-        f"accuracy {metrics_fixed['accuracy']:.4f}; the tuned threshold improves anomaly F1 "
+        f"accuracy {metrics_fixed['accuracy']:.4f}; the tuned threshold changes anomaly F1 "
         f"by {metrics_tuned['f1_positive'] - metrics_fixed['f1_positive']:+.4f}."
     )
     lines.append(
