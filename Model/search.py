@@ -43,6 +43,8 @@ _NAN_STRATEGY_CHOICES = (
     "fill_constant",
 )
 
+_THRESHOLD_SELECTION_CHOICES = ("youden", "f1", "fbeta")
+
 
 def _epoch_choices(max_epochs: int) -> list[int]:
     max_epochs = max(1, int(max_epochs))
@@ -77,6 +79,59 @@ def _resolve_flip_axes(
     if canonicalize_right:
         axes = tuple(axis for axis in axes if axis != right_flip_axis)
     return axes
+
+
+def _study_has_incompatible_categorical(
+    study: optuna.Study,
+    param_name: str,
+    choices: list[str],
+) -> bool:
+    """Return True if any prior trial recorded ``param_name`` with different choices.
+
+    Optuna disallows changing a CategoricalDistribution's value space mid-study,
+    so a proactive check lets us route around the conflict without depending on
+    the exact ValueError message Optuna raises.
+    """
+    target = tuple(choices)
+    for prior in study.get_trials(deepcopy=False):
+        existing = prior.distributions.get(param_name)
+        if existing is None:
+            continue
+        if isinstance(existing, optuna.distributions.CategoricalDistribution):
+            return tuple(existing.choices) != target
+        return True
+    return False
+
+
+def _sample_threshold_config(
+    trial: optuna.Trial,
+    base_train: TrainConfig,
+    threshold_selection_choices: list[str] | tuple[str, ...] | None = None,
+) -> tuple[str, float]:
+    """Sample validation-threshold selection knobs for an Optuna trial.
+
+    Older studies may have recorded ``threshold_selection`` with only
+    ``["fbeta"]`` as its categorical distribution. Optuna disallows changing a
+    categorical value space when resuming those studies, so fall back to a v2
+    parameter name only in that compatibility case.
+    """
+    choices = list(dict.fromkeys(threshold_selection_choices or _THRESHOLD_SELECTION_CHOICES))
+    if not choices:
+        raise ValueError("threshold_selection_choices must contain at least one choice.")
+
+    param_name = (
+        "threshold_selection_v2"
+        if _study_has_incompatible_categorical(trial.study, "threshold_selection", choices)
+        else "threshold_selection"
+    )
+    threshold_selection = trial.suggest_categorical(param_name, choices)
+
+    threshold_fbeta = (
+        trial.suggest_float("threshold_fbeta", 1.5, 2.5)
+        if threshold_selection == "fbeta"
+        else base_train.threshold_fbeta
+    )
+    return threshold_selection, threshold_fbeta
 
 
 def parse_args() -> argparse.Namespace:
@@ -120,6 +175,13 @@ def parse_args() -> argparse.Namespace:
         default=[48, 64, 80],
         help="Optuna target edge search space. Pass one value (e.g. --target-edge-choices 64) "
              "to avoid expensive 80^3 trials.",
+    )
+    parser.add_argument(
+        "--threshold-selection-choices",
+        nargs="+",
+        choices=list(_THRESHOLD_SELECTION_CHOICES),
+        default=list(_THRESHOLD_SELECTION_CHOICES),
+        help="Optuna threshold_selection search space. Pass one or more of: youden f1 fbeta.",
     )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="auto")
@@ -204,6 +266,7 @@ def _sample_trial_configs(
     force_augmentation: bool = False,
     force_amp: bool = False,
     target_edge_choices: list[int] | None = None,
+    threshold_selection_choices: list[str] | tuple[str, ...] | None = None,
 ) -> tuple[DataConfig, AugmentationConfig, ModelConfig, TrainConfig]:
     target_edges = sorted({int(edge) for edge in (target_edge_choices or [48, 64, 80])})
     target_edge = trial.suggest_categorical("target_edge", target_edges)
@@ -379,16 +442,11 @@ def _sample_trial_configs(
         if loss_type == "focal"
         else base_train.focal_gamma
     )
-    # When the user explicitly optimizes F1 (--primary-metric f1), align the
-    # threshold selector: β=1.0 → F1. Otherwise keep recall-priority β ∈ [1.5, 2.5]
-    # (Youden/F1 don't penalize missed anomalies enough for the clinical use-case).
-    threshold_selection = trial.suggest_categorical(
-        "threshold_selection", ["fbeta"],
+    threshold_selection, threshold_fbeta = _sample_threshold_config(
+        trial,
+        base_train,
+        threshold_selection_choices=threshold_selection_choices,
     )
-    if base_train.primary_metric == "f1":
-        threshold_fbeta = 1.0
-    else:
-        threshold_fbeta = trial.suggest_float("threshold_fbeta", 1.5, 2.5)
     # Narrowed strategy choices to the two that actually meaningfully reweight
     # the minority class on this 3:1-imbalanced split. Mutual exclusion below:
     # if the WeightedRandomSampler is on, batches are already balanced — adding
@@ -560,7 +618,10 @@ def _configs_from_params(
         gradient_clip_norm=params.get("gradient_clip_norm", base_train.gradient_clip_norm),
         use_weighted_sampler=params.get("use_weighted_sampler", base_train.use_weighted_sampler),
         amp=params.get("amp", base_train.amp),
-        threshold_selection=params.get("threshold_selection", base_train.threshold_selection),
+        threshold_selection=params.get(
+            "threshold_selection_v2",
+            params.get("threshold_selection", base_train.threshold_selection),
+        ),
         threshold_fbeta=params.get("threshold_fbeta", base_train.threshold_fbeta),
         calibration_method=params.get("calibration_method", base_train.calibration_method),
         tta_enabled=params.get("tta_enabled", base_train.tta_enabled),
@@ -667,6 +728,7 @@ def main() -> None:
             force_augmentation=args.force_augmentation,
             force_amp=args.force_amp,
             target_edge_choices=args.target_edge_choices,
+            threshold_selection_choices=args.threshold_selection_choices,
         )
         use_cv = args.n_folds > 1
         try:

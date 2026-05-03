@@ -34,16 +34,25 @@ TABULAR_FEATURE_NAMES = ("log_voxel_count_z", "side_is_left")
 
 
 def release_gpu_memory() -> None:
-    """Drop Python GC garbage and ask CUDA to release the caching allocator.
+    """Drop Python GC garbage and best-effort release CUDA cache memory.
 
     Without this, repeated trainings (Optuna trials, CV folds) accumulate
     fragmentation in the PyTorch caching allocator and eventually OOM even
-    though no live tensors remain.
+    though no live tensors remain. CUDA can be left in an error state after an
+    OOM, so cleanup itself must never mask the original failure.
     """
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
+    try:
+        cuda_available = torch.cuda.is_available()
+    except Exception:
+        return
+    if not cuda_available:
+        return
+    for cleanup in (torch.cuda.empty_cache, torch.cuda.ipc_collect):
+        try:
+            cleanup()
+        except Exception:
+            pass
 
 
 def _raise_trial_pruned(message: str) -> None:

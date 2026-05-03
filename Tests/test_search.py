@@ -3,6 +3,8 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
+import optuna
+
 from Utils.config import AugmentationConfig, DataConfig, ModelConfig, TrainConfig
 from Model.search import (
     _configs_from_params,
@@ -10,6 +12,7 @@ from Model.search import (
     _flip_axes_from_choice,
     _patience_choices,
     _resolve_flip_axes,
+    _sample_threshold_config,
 )
 
 
@@ -67,6 +70,90 @@ class ResolveFlipAxesTest(unittest.TestCase):
 
     def test_fallback_respected_when_choice_none(self) -> None:
         self.assertEqual(_resolve_flip_axes(None, (1, 2), True, 2), (1,))
+
+
+class ThresholdConfigSearchTest(unittest.TestCase):
+    def test_searches_all_threshold_selection_choices(self) -> None:
+        captured: list[str] = []
+
+        def objective(trial: optuna.Trial) -> float:
+            selection, _ = _sample_threshold_config(trial, TrainConfig())
+            captured.append(selection)
+            return 0.0
+
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=optuna.samplers.GridSampler(
+                {
+                    "threshold_selection": ["youden", "f1", "fbeta"],
+                    "threshold_fbeta": [2.0],
+                }
+            ),
+        )
+        study.optimize(objective, n_trials=3)
+
+        self.assertEqual(set(captured), {"youden", "f1", "fbeta"})
+
+    def test_fbeta_beta_is_only_sampled_for_fbeta_selection(self) -> None:
+        captured: dict[str, tuple[str, float, bool]] = {}
+
+        def objective(trial: optuna.Trial) -> float:
+            selection, beta = _sample_threshold_config(trial, TrainConfig(threshold_fbeta=1.0))
+            captured[selection] = (selection, beta, "threshold_fbeta" in trial.params)
+            return 0.0
+
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=optuna.samplers.GridSampler(
+                {
+                    "threshold_selection": ["youden", "f1", "fbeta"],
+                    "threshold_fbeta": [2.0],
+                }
+            ),
+        )
+        study.optimize(objective, n_trials=3)
+
+        self.assertEqual(captured["youden"], ("youden", 1.0, False))
+        self.assertEqual(captured["f1"], ("f1", 1.0, False))
+        self.assertEqual(captured["fbeta"], ("fbeta", 2.0, True))
+
+    def test_can_limit_threshold_selection_choices(self) -> None:
+        captured: list[str] = []
+
+        def objective(trial: optuna.Trial) -> float:
+            selection, _ = _sample_threshold_config(
+                trial,
+                TrainConfig(),
+                threshold_selection_choices=["youden", "f1"],
+            )
+            captured.append(selection)
+            return 0.0
+
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=optuna.samplers.GridSampler(
+                {"threshold_selection": ["youden", "f1"]}
+            ),
+        )
+        study.optimize(objective, n_trials=2)
+
+        self.assertEqual(set(captured), {"youden", "f1"})
+
+    def test_resuming_old_single_fbeta_study_uses_v2_param(self) -> None:
+        study = optuna.create_study(direction="maximize")
+
+        def old_objective(trial: optuna.Trial) -> float:
+            trial.suggest_categorical("threshold_selection", ["fbeta"])
+            return 0.0
+
+        study.optimize(old_objective, n_trials=1)
+
+        trial = study.ask()
+        selection, _ = _sample_threshold_config(trial, TrainConfig())
+
+        self.assertIn(selection, {"youden", "f1", "fbeta"})
+        self.assertIn("threshold_selection_v2", trial.params)
+        self.assertNotIn("threshold_selection", trial.params)
 
 
 class ConfigsFromParamsFlipAxisResolutionTest(unittest.TestCase):
