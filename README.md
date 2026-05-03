@@ -1,6 +1,8 @@
 # ALAN 3B Böbrek Anomali Sınıflandırması
 
-Bu proje, ALAN veri setindeki böbrek ROI hacimlerinde anomali olup olmadığını 3B ResNet modeliyle ikili sınıflandırma olarak ele alır. Girdi olarak `.npy` formatındaki 3B binary maske hacimleri kullanılır; eğitim sürecinde ön işleme, isteğe bağlı augmentasyon, tabular ek özellikler, erken durdurma ve Optuna tabanlı hiperparametre araması desteklenir.
+Bu proje, ALAN veri setindeki böbrek ROI hacimlerinde anomali varlığını ikili sınıflandırma problemi olarak ele alır. Girdi olarak `.npy` formatındaki 3B böbrek maskeleri kullanılır; eğitim hattı deterministik ön işleme, train-time augmentasyon, tabular ek özellikler, sınıf dengesizliği yönetimi, post-hoc kalibrasyon, eşik seçimi, Optuna araması, k-fold CV, OOF tahminleri ve OOF-kilitli ensemble değerlendirmesini destekler.
+
+Komutlar proje kök dizininden çalıştırılmalıdır.
 
 ## Proje Yapısı
 
@@ -8,39 +10,47 @@ Bu proje, ALAN veri setindeki böbrek ROI hacimlerinde anomali olup olmadığın
 TezModel/
 ├── ALAN/
 │   ├── info.csv              # ROI_id, subset ve ROI_anomaly alanları
-│   ├── metadata.csv          # Üretilmiş ROI istatistikleri
+│   ├── metadata.csv          # ROI istatistikleri ve bbox bilgisi
 │   ├── summary.json          # Veri seti özeti
 │   └── alan/                 # 3B .npy hacim dosyaları
 ├── Preprocessing/
 │   ├── analyze_dataset.py    # metadata.csv ve summary.json üretimi
-│   ├── dataset.py            # Kayıt okuma, split ayırma ve ön işleme
-│   └── transforms.py         # 3B flip, affine ve morfolojik augmentasyonlar
+│   ├── dataset.py            # Kayıt okuma, split ayırma, ön işleme ve cache
+│   ├── transforms.py         # 3B flip, affine ve morfolojik augmentasyonlar
+│   └── README.md             # Ön işleme ayrıntıları
 ├── Model/
-│   ├── resnet3d.py           # PyTorch ile ResNet3D-18 / ResNet3D-34
-│   ├── unet3d.py             # 3B U-Net tabanlı sınıflandırıcı (ikili anomali etiketi)
-│   ├── pointnet.py           # 3B maskelerden türetilen point cloud üzerinde çalışan PointNet
-│   ├── factory.py            # architecture alanına göre model kuran ortak fabrika
-│   ├── engine.py             # Eğitim, doğrulama, test, kalibrasyon ve TTA akışı
-│   ├── train.py              # Tek eğitim çalıştırması için CLI
-│   ├── search.py             # Optuna ile hiperparametre araması
-│   └── ensemble.py           # En iyi K Optuna trial'ı üzerinde soft-voting ensemble
+│   ├── resnet3d.py           # ResNet3D-18 / ResNet3D-34 sınıflandırıcıları
+│   ├── unet3d.py             # Logit üreten 3B U-Net sınıflandırıcı
+│   ├── pointnet.py           # 3B maskeden point cloud türeten PointNet
+│   ├── factory.py            # architecture alanına göre model kuran fabrika
+│   ├── engine.py             # Eğitim, CV, test, kalibrasyon ve kayıt akışı
+│   ├── train.py              # Tek eğitim veya k-fold CV CLI girişi
+│   ├── search.py             # Optuna hiperparametre araması
+│   ├── oof_predictions.py    # CV fold checkpoint'lerinden OOF tahminleri
+│   ├── ensemble.py           # OOF-kilitli kalibre ensemble değerlendirmesi
+│   ├── threshold_scan.py     # Kayıtlı olasılıklar üzerinde eşik taraması
+│   └── README.md             # Model katmanı ayrıntıları
 ├── Utils/
 │   ├── config.py             # Data, augmentasyon, model, eğitim ve arama ayarları
-│   ├── metrics.py            # ROC-AUC, PR-AUC, F1, F-beta, balanced accuracy vb.
+│   ├── metrics.py            # ROC-AUC, PR-AUC, F1, F-beta, MCC vb.
 │   ├── calibration.py        # Temperature / isotonic kalibrasyon ve bootstrap eşik seçimi
-│   ├── plot_metrics.py       # Metrik görselleştirme yardımcıları
-│   └── reproducibility.py    # Rastgelelik kontrolü
+│   ├── plot_metrics.py       # Görselleştirme yardımcıları
+│   ├── reproducibility.py    # Rastgelelik kontrolü
+│   └── README.md             # Yardımcı modüller ayrıntıları
 ├── Tests/
-│   ├── test_dataset.py       # Veri seti ve şekil kontrolleri
-│   ├── test_model.py         # Model çıktı şekli kontrolleri
-│   └── test_smoke.py         # Sentetik veriyle uçtan uca duman testi
+│   ├── test_dataset.py       # Gerçek veri, split ve cache kontrolleri
+│   ├── test_model.py         # Model/factory çıktı şekli ve guard testleri
+│   ├── test_search.py        # Optuna konfig rekonstrüksiyonu testleri
+│   ├── test_smoke.py         # Sentetik veriyle hafif entegrasyon testleri
+│   └── README.md             # Test kapsamı ayrıntıları
+├── evaluate_final.py         # Kayıtlı run için final test raporu ve figürler
 ├── requirements.txt
 └── README.md
 ```
 
 ## Veri Seti Özeti
 
-Mevcut `ALAN/summary.json` dosyasına göre veri seti aşağıdaki dağılıma sahiptir:
+Mevcut `ALAN/summary.json` dosyasına göre dağılım:
 
 | Özellik | Değer |
 |---|---:|
@@ -54,11 +64,9 @@ Mevcut `ALAN/summary.json` dosyasına göre veri seti aşağıdaki dağılıma s
 | Test split | 298 ROI |
 | NaN içeren örnek | 0 |
 
-Splitler `ZS-train`, `ZS-dev` ve `ZS-test` olarak tanımlıdır. Metadata üretimi sırasında aynı hastaya ait sol ve sağ ROI kayıtlarının farklı splitlere düşmediği kontrol edilir.
+Splitler `ZS-train`, `ZS-dev` ve `ZS-test` olarak beklenir. Metadata üretimi sırasında aynı hastaya ait ROI kayıtlarının farklı splitlere düşmediği kontrol edilir.
 
 ## Kurulum
-
-Komutları proje kök dizininden çalıştırın.
 
 Unix benzeri kabuklar için:
 
@@ -76,74 +84,63 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Temel gereksinimler:
-
-- Python 3.10 veya üzeri
-- PyTorch 2.0 veya üzeri (CUDA wheel kurulumu `requirements.txt` içinde korunur)
-- NumPy 1.24 veya üzeri
-- scikit-learn 1.0 veya üzeri
-- Optuna 3.0 veya üzeri
-- matplotlib, pytest
-
-PointNet mimarisi saf PyTorch ile uygulanmıştır; PyTorch Geometric, torch-scatter veya torch-cluster gibi nokta bulutuna özgü kütüphaneler gerekmez. Bu nedenle `requirements.txt` değişmeden kalır.
+Temel bağımlılıklar `requirements.txt` içinde tutulur: NumPy, scikit-learn, Optuna, matplotlib, pytest ve PyTorch. Dosyada CUDA 12.8 için `torch==2.11.0+cu128` pini bulunur; CUDA kullanmayan platformlarda PyTorch kurulumu ortamınıza göre ayrıca uyarlanabilir. PointNet uygulaması saf PyTorch kullanır; PyTorch Geometric, torch-scatter veya torch-cluster gerekmez.
 
 ## Hızlı Başlangıç
 
-Önce metadata dosyalarını üretin veya güncelleyin:
+Metadata dosyalarını üretmek veya güncellemek:
 
 ```bash
 python -m Preprocessing.analyze_dataset
 ```
 
-Ardından varsayılanlara yakın bir eğitim çalıştırın:
+Varsayılan ResNet3D akışına yakın tek eğitim:
 
 ```bash
 python -m Model.train \
-  --epochs 20 \
+  --architecture resnet3d \
+  --epochs 30 \
   --batch-size 8 \
-  --learning-rate 1e-3 \
-  --depth 18 \
-  --base-channels 32 \
-  --dropout 0.2 \
-  --optimizer adamw \
+  --learning-rate 2e-4 \
   --target-shape 64 64 64 \
-  --bbox-margin 8 \
-  --decision-threshold 0.5 \
-  --threshold-selection youden \
-  --calibration-method temperature \
-  --output-dir outputs/baseline
+  --output-dir outputs/resnet3d_baseline
 ```
 
-Recall'u öne çıkarmak isterseniz `--threshold-selection fbeta --threshold-fbeta 1.5`, kalibrasyonun yetersiz kaldığı durumlarda `--calibration-method temperature+isotonic`, değerlendirmede flip tabanlı test-time augmentation için `--tta` kullanılabilir.
+U-Net3D veya PointNet denemek için:
 
-Eğitim tamamlandığında model ve metrikler `outputs/baseline/` altına yazılır.
+```bash
+python -m Model.train \
+  --architecture unet3d \
+  --epochs 30 \
+  --batch-size 8 \
+  --output-dir outputs/unet3d_baseline
+
+python -m Model.train \
+  --architecture pointnet \
+  --pointnet-num-points 2048 \
+  --pointnet-point-features 4 \
+  --epochs 30 \
+  --batch-size 8 \
+  --output-dir outputs/pointnet_baseline
+```
+
+`--cv-folds 2` veya daha büyük verildiğinde `Model.train` tek train/dev/test akışı yerine k-fold cross-validation çalıştırır.
 
 ## Ön İşleme
 
-Her ROI için uygulanan ana adımlar şunlardır:
+`Preprocessing.dataset` her ROI için şu deterministik sırayı uygular:
 
 1. `.npy` hacmi `float32` olarak yüklenir.
 2. Seçilen NaN stratejisi uygulanır.
-3. Foreground voxel sınırlarına göre tight bounding box crop yapılır.
-4. İstenirse sağ böbrekler sol tarafa kanonikleştirilir.
+3. Foreground bbox ve `bbox_margin` ile crop yapılır.
+4. İstenirse sağ böbrekler `right_flip_axis` üzerinde kanonikleştirilir.
 5. Hacim küp forma pad edilir.
-6. Trilinear interpolation ile hedef boyuta yeniden örneklenir.
-7. Tensor değerleri `[0, 1]` aralığına kırpılır.
+6. Trilinear interpolation ile `target_shape` boyutuna yeniden örneklenir.
+7. Değerler `[0, 1]` aralığına kırpılır.
 
-Desteklenen NaN stratejileri:
+Varsayılan hedef boyut `64 x 64 x 64`, bbox margin `8`, cube padding açık, sağ böbrek kanonikleştirme kapalıdır. Desteklenen NaN stratejileri `none`, `drop_record`, `fill_zero`, `fill_mean`, `fill_median` ve `fill_constant` değerleridir.
 
-| Strateji | Açıklama |
-|---|---|
-| `none` | NaN değerlerine dokunmaz. Varsayılan davranıştır. |
-| `drop_record` | NaN içeren kayıtları splitlerden çıkarır. |
-| `fill_zero` | NaN voxel değerlerini `0` ile doldurur. |
-| `fill_mean` | NaN voxel değerlerini hacmin ortalamasıyla doldurur. |
-| `fill_median` | NaN voxel değerlerini hacmin medyanıyla doldurur. |
-| `fill_constant` | NaN voxel değerlerini `--nan-fill-value` ile doldurur. |
-
-Varsayılan hedef boyut `64 x 64 x 64` olarak ayarlanmıştır. Sağ böbreği kanonikleştirme (`--canonicalize-right`) varsayılan olarak kapalıdır.
-
-Ön işleme her epoch'ta tekrar çalıştığı için uzun eğitimlerde veya Optuna aramalarında cache açmak süreyi ciddi azaltabilir:
+Uzun eğitimlerde veya Optuna aramalarında deterministik ön işleme cache'i açılabilir:
 
 ```bash
 python -m Model.train \
@@ -152,282 +149,194 @@ python -m Model.train \
   --num-workers 4
 ```
 
-`disk` modu ilk geçişte deterministik crop/pad/resize sonuçlarını yazar, sonraki epoch/trial'larda bunları tekrar kullanır. Büyük datasetler ve `num_workers > 0` için önerilen mod budur. `memory` modu tek çalıştırmada daha hızlıdır ama tensorleri RAM'de ve her DataLoader worker sürecinde ayrı tutar; bu yüzden yalnızca küçük datasetlerde veya tercihen `--num-workers 0` ile kullanılmalıdır.
+Train split için augmentasyonlar `RandomFlip3D`, `RandomAffine3D` ve `RandomMorphology3D` ile uygulanır. Validation ve test splitlerinde augmentasyon kullanılmaz. Kapatmak için `--disable-augmentations` verilebilir.
 
-## Model
+Daha ayrıntılı veri formatı, metadata kolonları ve cache davranışı için [Preprocessing/README.md](Preprocessing/README.md) dosyasına bakın.
 
-Proje üç farklı 3B omurga mimarisini destekler ve `--architecture` argümanı ile seçilir:
+## Modeller
 
-- `resnet3d` (varsayılan): Saf PyTorch ile yazılmış ResNet3D. `--depth 18` ve `--depth 34` desteklenir.
-- `unet3d`: Sınıflandırma için uyarlanmış hafif bir 3B U-Net. Encoder-decoder ve skip bağlantılarından sonra global pooling ve küçük bir sınıflandırıcı başlığı kullanır; çıktı segmentasyon maskesi değil, logit değeridir.
-- `pointnet`: İkili 3B ROI maskesinden foreground voxellerin koordinatlarını çıkartarak sabit boyutlu bir point cloud oluşturur, koordinatları yaklaşık `[-1, 1]` aralığına normalize eder ve shared MLP + global max-pooling ile sınıflandırma logiti üretir. Eğitimde replacement ile rastgele örnekleme, değerlendirmede deterministik örnekleme kullanılır; boş maskeler güvenli bir şekilde sıfır noktalara düşürülür. Uygulama saf PyTorch'tur; PyTorch Geometric, torch-scatter veya torch-cluster gibi ek bağımlılıklar gerektirmez.
+Tüm mimariler `Model.factory` üzerinden aynı arayüzle kurulur. Ana giriş şekli `B x 1 x D x H x W`, çıktı şekli `B` boyutlu logit vektörüdür ve kayıp varsayılan olarak `BCEWithLogitsLoss` tabanlıdır.
 
-Ana giriş her üç mimaride de `1 x D x H x W` şekilli 3B ROI maskesidir ve çıktı `BCEWithLogitsLoss` ile uyumlu `(B,)` şekilli logit vektörüdür.
+| `--architecture` | Açıklama | Öne çıkan ayarlar |
+|---|---|---|
+| `resnet3d` | ResNet3D-18 veya ResNet3D-34 sınıflandırıcı | `--depth`, `--base-channels`, `--dropout`, `--norm-type` |
+| `unet3d` | Segmentasyon maskesi değil tek logit üreten 3B U-Net sınıflandırıcı | `--unet-depth`, `--unet-base-channels`, `--unet-channel-multiplier` |
+| `pointnet` | Foreground voxel koordinatlarından sabit boyutlu point cloud ile sınıflandırma | `--pointnet-num-points`, `--pointnet-point-features`, `--pointnet-mlp-channels` |
 
-U-Net seçildiğinde ek CLI argümanları kullanılabilir:
-
-| Parametre | Varsayılan | Açıklama |
-|---|---:|---|
-| `--unet-depth` | `4` | Encoder seviyesi sayısı |
-| `--unet-base-channels` | `16` | İlk seviyedeki kanal sayısı |
-| `--unet-channel-multiplier` | `2` | Her seviye arasındaki kanal çarpanı |
-| `--unet-bottleneck-channels` | `None` | Dar boğaz kanal sayısını açıkça belirlemek için opsiyonel |
-
-Örnek U-Net eğitimi:
-
-```bash
-python -m Model.train \
-  --architecture unet3d \
-  --unet-depth 4 \
-  --unet-base-channels 16 \
-  --unet-channel-multiplier 2 \
-  --epochs 20 \
-  --batch-size 8 \
-  --target-shape 64 64 64 \
-  --output-dir outputs/unet3d_baseline
-```
-
-PointNet seçildiğinde ek CLI argümanları kullanılabilir:
-
-| Parametre | Varsayılan | Açıklama |
-|---|---:|---|
-| `--pointnet-num-points` | `1024` | Her örnek için sabit örneklenen foreground voxel sayısı |
-| `--pointnet-point-features` | `3` | `3` yalnızca xyz, `4` ek bir occupancy kanalı ekler |
-| `--pointnet-mlp-channels` | `64 128 256` | Global pooling öncesi shared-MLP kanal zinciri |
-| `--pointnet-global-dim` | `512` | Max-pool sonrası global öznitelik boyutu |
-| `--pointnet-head-hidden-dim` | `128` | Sınıflandırıcı MLP'nin gizli boyutu (`0` → tek doğrusal katman) |
-| `--pointnet-binary-threshold` | `0.5` | Maske değerini foreground voxel olarak sayan eşik |
-| `--pointnet-use-input-transform` | kapalı | Birim matrise initialize edilmiş küçük bir T-Net'i xyz üzerinde uygular |
-
-Örnek PointNet eğitimi:
-
-```bash
-python -m Model.train \
-  --architecture pointnet \
-  --pointnet-num-points 1024 \
-  --pointnet-mlp-channels 64 128 256 \
-  --pointnet-global-dim 512 \
-  --pointnet-head-hidden-dim 128 \
-  --epochs 20 \
-  --batch-size 8 \
-  --target-shape 64 64 64 \
-  --output-dir outputs/pointnet_baseline
-```
-
-Varsayılan olarak modele iki ek tabular özellik de verilir:
-
-| Özellik | Açıklama |
-|---|---|
-| `log_voxel_count_z` | `log1p(voxel_count)` değerinin train split istatistikleriyle normalize edilmiş hali |
-| `side_is_left` | Sol ROI için `1`, sağ ROI için `0` |
-
-Bu özellikler yalnızca train split üzerinden hesaplanan istatistiklerle normalize edilir; doğrulama ve test bilgisinin eğitime sızması engellenir. Ek özellikleri kapatmak için `--disable-tabular-features` kullanılabilir.
+Tabular ek özellikler varsayılan olarak açıktır. `log_voxel_count_z` ve `side_is_left`, yalnızca train split istatistikleriyle normalize edilerek model başlığına eklenir. Kapatmak için `--disable-tabular-features` kullanılabilir.
 
 ## Eğitim Akışı
 
-`Model.train` aşağıdaki işleri tek çalıştırmada yürütür:
+`Model.engine` eğitim sırasında şu işleri yönetir:
 
-- veri kayıtlarını yükler ve splitlere ayırır,
-- sadece train split için augmentasyon uygular,
-- sınıf dengesizliği için `BCEWithLogitsLoss` içinde pozitif sınıf ağırlığı kullanır,
-- seçilen optimizer ve scheduler ile eğitir,
-- doğrulama skoruna göre en iyi checkpoint'i kaydeder,
-- validasyon üzerinde post-hoc olasılık kalibrasyonu (temperature ve/veya isotonic) uygular,
-- bootstrap-ortalamalı karar eşiğini (Youden / F1 / F-beta) validasyondan seçer,
-- isteğe bağlı flip tabanlı test-time augmentation ile en iyi checkpoint üzerinde test setini değerlendirir.
+1. Kayıtları yükler, splitlere ayırır ve DataLoader'ları kurar.
+2. Sadece train split için augmentasyon uygular.
+3. Sınıf dengesizliği için pozitif sınıf ağırlığı veya weighted sampler kullanabilir.
+4. `adam`, `adamw` veya `sgd` optimizer'ı ve isteğe bağlı cosine scheduler/warmup ile eğitir.
+5. `--primary-metric` skoruna göre en iyi checkpoint'i `best_model.pt` olarak kaydeder.
+6. Validation tahminleri üzerinden temperature ve/veya isotonic kalibrasyon uygular.
+7. `youden`, `f1`, `fbeta` veya `fixed` yöntemiyle karar eşiğini seçer.
+8. Test seti için tuned ve fixed eşik metriklerini, tahminleri ve bootstrap güven aralıklarını kaydeder.
 
-Cihaz seçimi `--device auto` ile otomatik yapılır. Uygunsa CUDA, ardından Apple MPS, aksi halde CPU kullanılır.
+Sık kullanılan eğitim seçenekleri:
 
-Başlıca eğitim parametreleri:
-
-| Parametre | Varsayılan | Açıklama |
-|---|---:|---|
-| `--epochs` | `20` | Maksimum epoch sayısı |
-| `--batch-size` | `8` | Mini-batch boyutu |
-| `--learning-rate` | `1e-3` | Öğrenme oranı |
-| `--optimizer` | `adamw` | `adam`, `adamw` veya `sgd` |
-| `--scheduler` | `cosine` | `cosine` veya `none` |
-| `--patience` | `6` | Erken durdurma sabrı |
-| `--gradient-clip-norm` | `1.0` | Gradient clipping sınırı |
-| `--decision-threshold` | `0.5` | `fixed` modunda kullanılan sabit eşik |
-| `--threshold-selection` | `youden` | `youden`, `f1`, `fbeta` veya `fixed` |
-| `--threshold-fbeta` | `1.0` | `fbeta` modunda beta; >1 recall'u öne çıkarır |
-| `--calibration-method` | `temperature` | `temperature`, `isotonic` veya `temperature+isotonic` |
-| `--tta` | kapalı | Değerlendirmede flip tabanlı test-time augmentation |
-| `--disable-calibration` | kapalı | Tüm post-hoc kalibrasyonu devre dışı bırakır |
-
-Eğitim çıktıları:
-
-| Dosya | Açıklama |
+| Alan | CLI |
 |---|---|
-| `config.json` | Çalıştırmada kullanılan tam konfigürasyon |
-| `history.json` | Epoch bazlı train ve validation metrikleri |
-| `best_val_metrics.json` | En iyi validation epoch metrikleri |
-| `test_metrics.json` | En iyi checkpoint ile test metrikleri |
-| `calibration.json` | Temperature / isotonic kalibrasyon, reliability bin'leri, seçilen eşik ve kalibre probabiliteler |
-| `best_model.pt` | En iyi model checkpoint'i |
+| Veri şekli | `--target-shape`, `--bbox-margin`, `--disable-bbox-crop`, `--disable-pad-to-cube` |
+| NaN davranışı | `--nan-strategy`, `--nan-fill-value` |
+| Cache | `--cache-mode none/memory/disk`, `--cache-dir` |
+| Optimizasyon | `--optimizer`, `--learning-rate`, `--weight-decay`, `--scheduler`, `--warmup-epochs` |
+| Dengesizlik | `--pos-weight-strategy`, `--use-weighted-sampler`, `--loss-type bce/focal`, `--focal-gamma` |
+| Seçim/metrik | `--primary-metric`, `--threshold-selection`, `--threshold-fbeta`, `--threshold-min-specificity`, `--threshold-min-precision` |
+| Kalibrasyon | `--calibration-method temperature/isotonic/temperature+isotonic`, `--disable-calibration` |
+| Donanım | `--device auto/cuda/mps/cpu`, `--disable-amp`, `--num-workers` |
 
-## Augmentasyonlar
+Tek eğitim çıktıları `--output-dir` altına yazılır:
 
-Augmentasyonlar yalnızca train split üzerinde uygulanır.
-
-| Augmentasyon | Açıklama |
-|---|---|
-| `RandomFlip3D` | Seçilen eksenlerde olasılıksal flip |
-| `RandomAffine3D` | Küçük rotasyon, öteleme ve ölçekleme |
-| `RandomMorphology3D` | Düşük olasılıklı dilatasyon veya erozyon |
-
-Veri binary maske olduğu için brightness, contrast veya noise gibi yoğunluk augmentasyonları kullanılmaz. Tüm augmentasyonları kapatmak için `--disable-augmentations` verilebilir.
-
-## Hiperparametre Araması
-
-Optuna tabanlı arama için:
-
-```bash
-python -m Model.search \
-  --n-trials 30 \
-  --epochs 12 \
-  --device auto \
-  --cache-mode disk \
-  --num-workers 4 \
-  --output-dir outputs/optuna \
-  --final-epochs 20
+```text
+outputs/<run>/
+├── best_model.pt
+├── checkpoint_meta.json
+├── config.json
+├── history.json
+├── best_val_metrics.json
+├── calibration.json
+├── test_metrics.json
+├── test_metrics_fixed_threshold.json
+├── test_predictions.json
+└── test_confidence_intervals.json
 ```
 
-`--epochs`, her trial için maksimum epoch bütçesidir; arama sırasında bu bütçenin daha kısa alt değerleri de denenebilir. `--final-epochs` verilirse en iyi trial parametreleriyle `best_run/` altında bu epoch sayısıyla yeniden eğitim yapılır. Verilmezse en iyi trial'ın epoch bütçesi kullanılır.
+CV modunda her fold kendi `fold_XX/` klasörüne `best_model.pt` ve `fold_result.json` yazar; kök klasörde `cv_summary.json` oluşur.
 
-Arama uzayı mimari seçimini (`resnet3d` / `unet3d` / `pointnet`), learning rate, weight decay, optimizer, scheduler, batch size, epoch bütçesi, early stopping patience, gradient clipping, eşik seçimi stratejisi (`youden` / `f1` / `fbeta`) ve F-beta değeri, kalibrasyon yöntemi (`temperature` / `isotonic` / `temperature+isotonic`), flip tabanlı TTA, AMP, weighted sampler, ResNet derinliği ve kanal sayısı, U-Net derinliği / base channel / kanal çarpanı, PointNet için `pointnet_num_points` ∈ {512, 1024, 2048, 4096}, global dim, MLP varyantı (`small` / `medium` / `large`), sınıflandırıcı head boyutu, nokta özellik sayısı ve opsiyonel input transform, dropout, tabular özellik kullanımı, hedef hacim boyutu, bounding box crop, cube padding, sağ böbrek kanonikleştirme, NaN stratejisi ve augmentasyon parametrelerini kapsar. Mimariye özgü hiperparametreler yalnızca ilgili mimari seçildiğinde örneklenir; eski (mimari alanı içermeyen) trial parametreleri geriye dönük olarak ResNet3D varsayımıyla yeniden kurulur, PointNet-özgü alanları eksik trial'lar ise PointNet için güvenli varsayılanlara düşer.
+## Optuna Araması
 
-Arama uzayında PointNet'i de içeren örnek komut:
+Hiperparametre araması için:
 
 ```bash
 python -m Model.search \
-  --n-trials 30 \
-  --epochs 12 \
-  --device auto \
-  --cache-mode disk \
+  --architecture resnet3d \
+  --output-dir outputs/optuna_resnet3d \
+  --study-name alan_resnet3d \
+  --n-trials 20 \
+  --n-folds 3 \
+  --epochs 30 \
   --target-edge-choices 48 64 \
-  --output-dir outputs/optuna_with_pointnet
+  --cache-mode disk
 ```
 
-Varsayılan aramada Optuna `MedianPruner` kötü giden trial'ları erken kesebilir. Tam eski davranış istenirse `--disable-pruning` kullanılabilir; en pahalı hacim boyutunu dışarıda bırakmak için `--target-edge-choices 48 64`, tamamen sabitlemek için `--target-edge-choices 64` verilebilir.
+`--n-folds 1` varsayılan eski train/dev objektifini kullanır; daha büyük değerlerde HPO skoru CV fold metriklerinden hesaplanır. Final `best_run/` yeniden eğitimi tek ZS train/dev/test akışını kullanır.
 
-Optuna çıktıları:
+Arama çıktıları:
 
 | Dosya/Klasör | Açıklama |
 |---|---|
-| `trial_000/`, `trial_001/`, ... | Her trial için eğitim çıktıları |
-| `trial_summary.json` | İlgili trial parametreleri ve metrikleri |
+| `optuna_study.db` | Aynı `--output-dir` ve `--study-name` ile devam edilebilen SQLite study |
+| `trial_000/`, `trial_001/`, ... | Her trial için eğitim veya CV çıktıları |
+| `trial_summary.json` | Trial parametreleri ve skor özeti |
 | `leaderboard.json` | Trial sıralaması |
-| `best_run/` | En iyi parametrelerle yeniden eğitim |
-| `best_model.pt` | En iyi modelin kök arama klasöründeki kopyası |
-| `study_summary.json` | Genel arama özeti |
+| `best_run/` | En iyi trial parametreleriyle final yeniden eğitim |
+| `best_model.pt` | En iyi final modelin arama kökündeki kopyası |
+| `study_summary.json` | Arama ve final değerlendirme özeti |
+| `final_evaluation/` | Başarılı olursa otomatik final test raporu |
 
-## Ensemble
+Mimariye göre arama uzayı değişir: ResNet3D için derinlik/kanal sayısı, U-Net3D için encoder ayarları, PointNet için nokta sayısı/MLP/global boyut/input transform ve tüm mimariler için ortak eğitim, veri, augmentasyon, kalibrasyon ve eşik ayarları örneklenir.
 
-Arama tamamlandıktan sonra en iyi K trial'ın checkpoint'leri soft-voting ile birleştirilebilir:
+## OOF Tahminleri ve Ensemble
+
+CV fold checkpoint'lerinden out-of-fold tahmin üretmek için:
+
+```bash
+python -m Model.oof_predictions \
+  --study-dir outputs/optuna_resnet3d \
+  --trial-number 7 \
+  --device auto
+```
+
+Bu komut `outputs/optuna_resnet3d/trial_007/oof_predictions.json` üretir. OOF tahminleri fold bazlı temperature kalibrasyonu, pooled isotonic kalibrasyon metadatası ve OOF üzerinden seçilmiş `f1_threshold` / `clinical_threshold` bilgilerini içerir.
+
+Birden fazla CV trial'ı OOF üzerinde kilitlenen eşikle ensemble etmek için:
 
 ```bash
 python -m Model.ensemble \
-  --study-dir outputs/optuna \
-  --top-k 5
+  --study-dirs outputs/optuna_resnet3d outputs/optuna_unet3d \
+  --trial-numbers 7 4 \
+  --output-dir outputs/ensemble_oof \
+  --probability-mode arithmetic \
+  --threshold-name f1_threshold
 ```
 
-`Model.ensemble`, `leaderboard.json` üzerinden en iyi K trial'ı seçer, her trial'ın `best_model.pt` ve `checkpoint_meta.json` dosyalarından konfigürasyonu yeniden kurar (ResNet3D, U-Net3D ve PointNet trial'ları karışık olsa bile her bir trial doğru mimaride yeniden oluşturulur), test splitinde kalibre probabiliteleri ortalar ve bootstrap güven aralıklarıyla birlikte ensemble metriklerini raporlar.
+Ensemble test setinde eşik veya üye seçimi yapmaz. Eşik OOF tahminlerinden seçilir, test spliti bu kilitli eşikle bir kez raporlanır. Çıktılar:
 
-## Kalibrasyon ve Eşik Seçimi
+```text
+outputs/ensemble_oof/
+├── ensemble_predictions.json
+├── oof_thresholds.json
+├── final_test_metrics.json
+├── test_confidence_intervals.json
+└── interpretation.txt
+```
 
-`Utils/calibration.py` şu araçları sağlar:
+`--threshold-name clinical_threshold`, F-beta tabanlı ve minimum specificity korumalı klinik odaklı alternatifi kullanır. Olasılık birleştirme için `--probability-mode arithmetic` veya `logit` seçilebilir.
 
-- `fit_temperature` / `apply_temperature`: validasyon logitleri üzerinde tek skalerli temperature scaling.
-- `fit_isotonic` / `apply_isotonic`: temperature sonrası olasılıklar üzerinde monoton parçalı-lineer isotonic regresyon (yoğunluk dağılımı bimodal veya çarpık olduğunda faydalıdır).
-- `reliability_bins` ve `expected_calibration_error`: reliability diyagramı ve ECE hesabı.
-- `select_threshold_bootstrap`: bootstrap-ortalamalı Youden, F1 veya F-beta ile eşik seçimi — tek splitten kaynaklanan varyansı azaltır.
+## Eşik Taraması
 
-Seçilen yöntem ve sonuçlar her çalıştırmanın `calibration.json` dosyasına yazılır; test metrikleri kalibre edilmiş probabilitelerle ve seçilen eşikle raporlanır.
-
-## Testler
-
-Pytest ile:
+Kayıtlı validation/test olasılıkları üzerinde hızlı eşik incelemesi:
 
 ```bash
-python -m pytest Tests/ -v
+python -m Model.threshold_scan --run-dir outputs/resnet3d_baseline
 ```
 
-Standart unittest keşfi ile:
+Varsayılan olarak kalibre olasılıkları kullanılır. Ham olasılıklarla karşılaştırmak için `--use-uncalibrated` eklenebilir.
+
+## Final Değerlendirme
+
+`evaluate_final.py`, `best_model.pt` ve `config.json` bulunan bir run klasörünü okuyarak son test metriklerini, sınıflandırma raporlarını, tanılayıcı figürleri ve kısa yorumu üretir. Mimari `config.json` içinden okunduğu için ResNet3D, U-Net3D ve PointNet run'ları aynı CLI ile değerlendirilebilir.
 
 ```bash
-python -m unittest discover -s Tests -v
+python evaluate_final.py \
+  --run-dir outputs/optuna_resnet3d/best_run \
+  --use-saved-predictions
 ```
 
-Testler veri seti dönüşümlerini, model çıktı şekillerini ve sentetik veriyle uçtan uca eğitim akışını kontrol eder.
+Varsayılan çıktı yolu `results/final_evaluation/<architecture>_<run>/` biçimindedir. `--threshold` ile kayıtlı tuned eşik yerine geçici bir karar eşiği verilebilir.
 
 ## Metrikler
 
-Tüm ikili sınıflandırma metrikleri tek bir kaynaktan, `Utils/metrics.py` içindeki `compute_binary_classification_metrics` fonksiyonundan üretilir. `Model/engine.py`, `Model/ensemble.py` ve `evaluate_final.py` aynı yardımcıyı çağırır; aynı metrik için farklı dosyalarda farklı formüller kullanılmaz.
+Metrikler `Utils.metrics.compute_binary_classification_metrics` üzerinden merkezi olarak üretilir. Eğitim, ensemble ve final değerlendirme aynı yardımcıları kullanır.
 
-Mevcut JSON çıktı anahtarları korunmuştur. Eğitim ve değerlendirme sırasında raporlanan metrikler:
+Raporlanan ana metrikler: `accuracy`, `balanced_accuracy`, `precision`, `recall`, `f1`, `sensitivity`, `specificity`, `npv`, `fpr`, `fnr`, `fdr`, `for`, `mcc`, `cohen_kappa`, macro/weighted ortalamalar, `roc_auc`, `pr_auc`, confusion matrix bileşenleri ve destek sayılarıdır. Tek sınıflı `y_true` durumunda ROC-AUC/PR-AUC güvenli şekilde `NaN` döner.
 
-- `loss`
-- `accuracy`, `balanced_accuracy`
-- `precision`, `recall`, `f1` (pozitif sınıf — geriye dönük uyumluluk)
-- `precision_positive`, `recall_positive` (`= sensitivity`), `f1_positive`
-- `sensitivity`, `specificity`
-- `npv` (negative predictive value)
-- `fpr`, `fnr`, `fdr`, `for` (false positive / negative / discovery / omission rate)
-- `mcc` (Matthews correlation coefficient)
-- `cohen_kappa`
-- `macro_precision`, `macro_recall`, `macro_f1`
-- `weighted_precision`, `weighted_recall`, `weighted_f1`
-- `roc_auc`, `pr_auc` — `y_true` tek sınıf içerdiğinde güvenli şekilde `NaN` döner, fonksiyon hata vermez
-- F-beta (eşik seçimi için)
-- expected calibration error (ECE) — kalibrasyon öncesi/sonrası
-- confusion matrix bileşenleri: `tn`, `fp`, `fn`, `tp`
-- destek sayıları: `support`, `support_positive`, `support_negative`
+Tek eğitimde varsayılan checkpoint seçimi `pr_auc` ile yapılır. Optuna aramasında varsayılan objektif `roc_auc` değeridir; iki akışta da metrik hesaplanamazsa yardımcı fonksiyon uygun fallback zincirine düşer.
 
-Bütün oran tabanlı metrikler bölme-payda sıfır olduğunda `0.0` döner; `mcc` payda sıfırlandığında 0, `roc_auc` / `pr_auc` ise `NaN` olur.
+Konfig, metrik, kalibrasyon, grafik ve tekrarlanabilirlik yardımcılarının ayrıntıları için [Utils/README.md](Utils/README.md) dosyasına bakın.
 
-Model seçimi varsayılan olarak `roc_auc` üzerinden yapılır. Seçilen metrik hesaplanamazsa sırasıyla `pr_auc`, `balanced_accuracy`, `f1` ve negatif loss değerine düşülür.
+## Testler
 
-## Final Değerlendirme (`evaluate_final.py`)
-
-`evaluate_final.py`, eğitilmiş bir koşuyu (`best_model.pt` + `config.json`) tekrar test setinde değerlendirip yukarıdaki tüm metrikleri (`final_test_metrics.json`) ve yüksek çözünürlüklü tanılayıcı çizimleri (`01_*.png` … `07_*.png`), sınıflandırma raporlarını ve kısa bir yorumu üretir. Mimari `config.json` içinden okunduğu için ResNet3D, U-Net3D ve PointNet koşuları aynı CLI ile değerlendirilebilir.
-
-Manuel kullanım:
+Tüm testleri çalıştırmak:
 
 ```bash
-python evaluate_final.py --run-dir outputs/optuna/best_run
-python evaluate_final.py --run-dir outputs/optuna/best_run --use-saved-predictions
-python evaluate_final.py --run-dir outputs/optuna/best_run --threshold 0.42
+python -m pytest Tests
 ```
 
-Programatik kullanım (Optuna araması ve diğer betikler bunu çağırır):
+`unittest` ile eşdeğer keşif:
 
-```python
-from pathlib import Path
-from evaluate_final import run_final_evaluation
-
-result = run_final_evaluation(
-    run_dir=Path("outputs/optuna/best_run"),
-    output_dir=None,                # default: results/final_evaluation/<arch>_<run-dir-name>
-    use_saved_predictions=True,     # test_predictions.json varsa inferansı tekrar etme
-    threshold=None,                 # None → config.json'daki tuned threshold
-)
+```bash
+python -m unittest discover -s Tests -p "test_*.py"
 ```
 
-Optuna araması (`Model/search.py`) tamamlandığında en iyi parametrelerle `best_run/` altına yapılan final yeniden eğitiminin ardından `run_final_evaluation` **otomatik olarak** çağrılır:
+Gerçek ALAN dosyalarına bağlı testler `Tests/test_dataset.py` içindedir. Saf sentetik ve daha hızlı kontroller için önce şu komut kullanılabilir:
 
-- Çıktı dizini `<search_output_dir>/final_evaluation/` altına yazılır.
-- `best_run/test_predictions.json` mevcutsa o dosya kullanılır (inferans tekrar edilmez); yoksa güvenli bir şekilde taze inferansa düşülür.
-- Final değerlendirme başarısız olursa eğitim çıktıları kaybolmaz; uyarı yazdırılır ve hata mesajı `study_summary.json` içindeki `final_evaluation.error` alanına kaydedilir.
-- Başarılı olduğunda `study_summary.json` içindeki `final_evaluation` bloğu çıktı dizinini ve özet metrikleri (tuned/fixed eşik için) içerir.
+```bash
+python -m pytest Tests/test_model.py Tests/test_search.py Tests/test_smoke.py
+```
 
-Terminal özetinde gösterilen anahtar metrikler: accuracy, balanced accuracy, ROC-AUC, PR-AUC, sensitivity, specificity, precision, F1, MCC, Cohen's kappa ve confusion matrix.
+Test kapsamının ayrıntıları için [Tests/README.md](Tests/README.md) dosyasına bakın.
 
 ## Notlar
 
-- Komutlar proje kök dizininden çalıştırılmalıdır.
-- `ALAN/info.csv` ve `ALAN/alan/*.npy` dosyaları veri yükleme için beklenen varsayılan konumlardır.
+- `ALAN/info.csv` ve `ALAN/alan/*.npy` varsayılan veri konumlarıdır.
 - `metadata.csv` eksikse veya beklenen NaN kolonlarını içermiyorsa otomatik olarak yeniden üretilebilir.
-- Sınıf dağılımı dengesiz olduğu için accuracy tek başına yeterli değildir; özellikle PR-AUC, ROC-AUC ve balanced accuracy birlikte yorumlanmalıdır.
+- `.npy` hacimleri değişirse bbox ve özet istatistikleri için metadata yeniden üretilmelidir.
+- Sınıf dağılımı dengesiz olduğu için accuracy tek başına yeterli değildir; PR-AUC, ROC-AUC, balanced accuracy, sensitivity/specificity ve eşik davranışı birlikte yorumlanmalıdır.
 - Bu kod araştırma ve deney amaçlıdır; klinik karar verme amacıyla doğrulanmış bir sistem olarak kullanılmamalıdır.
