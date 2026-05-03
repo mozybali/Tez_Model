@@ -1,230 +1,511 @@
-"""Soft-voting ensemble over the top-K Optuna trials.
-
-Reads ``leaderboard.json`` from an Optuna study directory, picks the K trials
-with the highest validation score, reloads each trial's best checkpoint, runs
-inference on the test split, averages the (temperature-calibrated) probabilities,
-and reports the ensemble's metrics and bootstrap confidence intervals.
-
-Usage:
-    python -m Model.ensemble --study-dir outputs/hpo_resnet3d_full --top-k 5
-
-Assumes each trial folder under the study directory contains:
-  - ``best_model.pt`` (checkpoint saved by Model/engine.py)
-  - ``checkpoint_meta.json`` (config snapshot written alongside the checkpoint)
-  - optionally ``calibration.json`` (for the temperature scalar)
-"""
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
-import torch
 
-from Model.engine import (
-    TABULAR_FEATURE_NAMES,
-    build_dataloaders,
-    collect_predictions,
-    resolve_device,
-    save_json,
+from Model.engine import save_json
+from Model.oof_predictions import (
+    compute_oof_thresholds,
+    load_or_generate_oof_predictions,
+    prediction_map_from_oof,
+    predict_trial_test_from_folds,
 )
-from Model.factory import build_model
-from Utils.calibration import apply_temperature, logits_from_probs
-from Utils.config import AugmentationConfig, DataConfig, ModelConfig, TrainConfig
-from Utils.metrics import bootstrap_confidence_intervals, compute_binary_classification_metrics, optimize_threshold
+from Utils.calibration import expected_calibration_error, logits_from_probs
+from Utils.metrics import bootstrap_confidence_intervals, compute_binary_classification_metrics
 
 
-def _load_json(path: Path) -> dict:
+def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
-def _reconstruct_configs(meta: dict) -> tuple[DataConfig, AugmentationConfig, ModelConfig, TrainConfig]:
-    data_raw = meta.get("data_config", {})
-    model_raw = meta.get("model_config", {})
-    train_raw = meta.get("train_config", {})
-
-    data_config = DataConfig(
-        info_csv=Path(data_raw.get("info_csv", "ALAN/info.csv")),
-        volumes_dir=Path(data_raw.get("volumes_dir", "ALAN/alan")),
-        metadata_csv=Path(data_raw.get("metadata_csv", "ALAN/metadata.csv")),
-        summary_json=Path(data_raw.get("summary_json", "ALAN/summary.json")),
-        train_subset=data_raw.get("train_subset", "ZS-train"),
-        val_subset=data_raw.get("val_subset", "ZS-dev"),
-        test_subset=data_raw.get("test_subset", "ZS-test"),
-        target_shape=tuple(data_raw.get("target_shape", (64, 64, 64))),
-        use_bbox_crop=data_raw.get("use_bbox_crop", True),
-        bbox_margin=data_raw.get("bbox_margin", 8),
-        pad_to_cube=data_raw.get("pad_to_cube", True),
-        canonicalize_right=data_raw.get("canonicalize_right", False),
-        right_flip_axis=data_raw.get("right_flip_axis", 0),
-        nan_strategy=data_raw.get("nan_strategy", "none"),
-        nan_fill_value=data_raw.get("nan_fill_value", 0.0),
-    )
-    aug_config = AugmentationConfig(enabled=False)  # inference-only
-
-    model_config = ModelConfig(
-        # Older checkpoints predating U-Net integration lack "architecture";
-        # default to ResNet3D so those runs keep reloading cleanly.
-        architecture=model_raw.get("architecture", "resnet3d"),
-        depth=model_raw.get("depth", 18),
-        in_channels=model_raw.get("in_channels", 1),
-        base_channels=model_raw.get("base_channels", 32),
-        dropout=model_raw.get("dropout", 0.0),
-        num_classes=model_raw.get("num_classes", 1),
-        use_tabular_features=model_raw.get("use_tabular_features", False),
-        tabular_hidden_dim=model_raw.get("tabular_hidden_dim", 16),
-        norm_type=model_raw.get("norm_type", "batch"),
-        group_norm_groups=model_raw.get("group_norm_groups", 8),
-        unet_depth=model_raw.get("unet_depth", 4),
-        unet_base_channels=model_raw.get("unet_base_channels", 16),
-        unet_channel_multiplier=model_raw.get("unet_channel_multiplier", 2),
-        unet_bottleneck_channels=model_raw.get("unet_bottleneck_channels", None),
-        pointnet_num_points=model_raw.get("pointnet_num_points", 1024),
-        pointnet_point_features=model_raw.get("pointnet_point_features", 3),
-        pointnet_mlp_channels=tuple(model_raw.get("pointnet_mlp_channels", (64, 128, 256))),
-        pointnet_global_dim=model_raw.get("pointnet_global_dim", 512),
-        pointnet_head_hidden_dim=model_raw.get("pointnet_head_hidden_dim", 128),
-        pointnet_binary_threshold=model_raw.get("pointnet_binary_threshold", 0.5),
-        pointnet_use_input_transform=model_raw.get("pointnet_use_input_transform", False),
-    )
-
-    train_config = TrainConfig(
-        output_dir=Path(train_raw.get("output_dir", "outputs/ensemble")),
-        epochs=1,
-        batch_size=train_raw.get("batch_size", 8),
-        num_workers=train_raw.get("num_workers", 0),
-        pin_memory=train_raw.get("pin_memory", True),
-        device=train_raw.get("device", "auto"),
-        seed=train_raw.get("seed", 42),
-        amp=False,
-    )
-    return data_config, aug_config, model_config, train_config
+def _member_name(study_dir: Path, trial_number: int) -> str:
+    return f"{Path(study_dir).name}/trial_{int(trial_number):03d}"
 
 
-def _run_trial_inference(trial_dir: Path, device: torch.device) -> dict:
-    checkpoint_meta = _load_json(trial_dir / "checkpoint_meta.json")
-    data_cfg, aug_cfg, model_cfg, train_cfg = _reconstruct_configs(checkpoint_meta)
+def _check_unique(ids: list[str], context: str) -> None:
+    duplicates = sorted({item for item in ids if ids.count(item) > 1})
+    if duplicates:
+        preview = ", ".join(duplicates[:5])
+        raise ValueError(f"{context}: duplicate ids detected: {preview}")
 
-    dataloaders, _ = build_dataloaders(
-        data_config=data_cfg,
-        augmentation_config=aug_cfg,
-        train_config=train_cfg,
-        device=device,
-    )
-    tabular_stats = checkpoint_meta.get("tabular_feature_stats")
 
-    model = build_model(
-        model_config=model_cfg,
-        num_tabular_features=len(TABULAR_FEATURE_NAMES) if model_cfg.use_tabular_features else 0,
-    ).to(device)
-    checkpoint = torch.load(trial_dir / "best_model.pt", map_location=device, weights_only=True)
-    model.load_state_dict(checkpoint["model_state_dict"])
+def _combine_probabilities(prob_stack: np.ndarray, mode: str) -> np.ndarray:
+    if prob_stack.ndim != 2:
+        raise ValueError(f"Expected a 2D probability stack, got shape {prob_stack.shape}.")
+    if mode == "arithmetic":
+        return np.mean(prob_stack, axis=0)
+    if mode == "logit":
+        clipped = np.clip(prob_stack, 1e-7, 1.0 - 1e-7)
+        logits = logits_from_probs(clipped)
+        return 1.0 / (1.0 + np.exp(-np.mean(logits, axis=0)))
+    raise ValueError(f"Unsupported probability mode: {mode}")
 
-    test_preds = collect_predictions(model, dataloaders["test"], device, tabular_stats)
-    val_preds = collect_predictions(model, dataloaders["val"], device, tabular_stats)
 
-    temperature = 1.0
-    calibration_file = trial_dir / "calibration.json"
-    if calibration_file.exists():
-        try:
-            temperature = float(_load_json(calibration_file).get("temperature", 1.0))
-        except Exception:
-            temperature = 1.0
+def _align_oof_members(members: list[dict[str, Any]]) -> tuple[list[str], list[int], list[dict[str, Any]], np.ndarray]:
+    reference_ids: list[str] | None = None
+    reference_y: dict[str, int] | None = None
+    aligned_members: list[dict[str, Any]] = []
+    stacks: list[np.ndarray] = []
 
-    test_logits = np.asarray(test_preds.get("y_logit") or logits_from_probs(np.asarray(test_preds["y_prob"])))
-    val_logits = np.asarray(val_preds.get("y_logit") or logits_from_probs(np.asarray(val_preds["y_prob"])))
+    for member in members:
+        payload = member["oof_payload"]
+        predictions = payload.get("predictions", [])
+        ids = [str(sample["id"]) for sample in predictions]
+        _check_unique(ids, f"OOF {member['name']}")
+        sample_map = prediction_map_from_oof(payload)
+        y_map = {sample_id: int(sample["y_true"]) for sample_id, sample in sample_map.items()}
+
+        if reference_ids is None:
+            reference_ids = ids
+            reference_y = y_map
+        else:
+            if set(ids) != set(reference_ids):
+                missing = sorted(set(reference_ids).difference(ids))
+                extra = sorted(set(ids).difference(reference_ids))
+                raise ValueError(
+                    f"OOF ids differ for {member['name']}: missing={missing[:5]} extra={extra[:5]}"
+                )
+            assert reference_y is not None
+            for sample_id in reference_ids:
+                if y_map[sample_id] != reference_y[sample_id]:
+                    raise ValueError(f"OOF label mismatch for id {sample_id} in {member['name']}.")
+
+        assert reference_ids is not None
+        probs = np.asarray(
+            [float(sample_map[sample_id]["y_prob_calibrated"]) for sample_id in reference_ids],
+            dtype=np.float64,
+        )
+        stacks.append(probs)
+        aligned_members.append(
+            {
+                "member": member["name"],
+                "study_dir": str(member["study_dir"]),
+                "trial_number": int(member["trial_number"]),
+                "y_prob": probs.tolist(),
+            }
+        )
+
+    if reference_ids is None or reference_y is None:
+        raise ValueError("No OOF ensemble members were provided.")
+    y_true = [int(reference_y[sample_id]) for sample_id in reference_ids]
+    return reference_ids, y_true, aligned_members, np.stack(stacks, axis=0)
+
+
+def _align_test_members(members: list[dict[str, Any]]) -> tuple[list[str], list[int], list[dict[str, Any]], np.ndarray]:
+    reference_ids: list[str] | None = None
+    reference_y: dict[str, int] | None = None
+    aligned_members: list[dict[str, Any]] = []
+    stacks: list[np.ndarray] = []
+
+    for member in members:
+        payload = member["test_payload"]
+        ids = [str(sample_id) for sample_id in payload["ids"]]
+        y_true = [int(value) for value in payload["y_true"]]
+        _check_unique(ids, f"test {member['name']}")
+        y_map = {sample_id: label for sample_id, label in zip(ids, y_true)}
+
+        if reference_ids is None:
+            reference_ids = ids
+            reference_y = y_map
+        else:
+            if set(ids) != set(reference_ids):
+                missing = sorted(set(reference_ids).difference(ids))
+                extra = sorted(set(ids).difference(reference_ids))
+                raise ValueError(
+                    f"Test ids differ for {member['name']}: missing={missing[:5]} extra={extra[:5]}"
+                )
+            assert reference_y is not None
+            for sample_id in reference_ids:
+                if y_map[sample_id] != reference_y[sample_id]:
+                    raise ValueError(f"Test label mismatch for id {sample_id} in {member['name']}.")
+
+        assert reference_ids is not None
+        prob_map = {sample_id: float(prob) for sample_id, prob in zip(ids, payload["y_prob"])}
+        probs = np.asarray([prob_map[sample_id] for sample_id in reference_ids], dtype=np.float64)
+        stacks.append(probs)
+        aligned_members.append(
+            {
+                "member": member["name"],
+                "study_dir": str(member["study_dir"]),
+                "trial_number": int(member["trial_number"]),
+                "y_prob": probs.tolist(),
+            }
+        )
+
+    if reference_ids is None or reference_y is None:
+        raise ValueError("No test ensemble members were provided.")
+    y_true = [int(reference_y[sample_id]) for sample_id in reference_ids]
+    return reference_ids, y_true, aligned_members, np.stack(stacks, axis=0)
+
+
+def _load_single_model_comparisons(study_dirs: list[Path]) -> list[dict[str, Any]]:
+    comparisons: list[dict[str, Any]] = []
+    for study_dir in study_dirs:
+        final_metrics_path = Path(study_dir) / "final_evaluation" / "final_test_metrics.json"
+        study_summary_path = Path(study_dir) / "study_summary.json"
+        item: dict[str, Any] = {
+            "study_dir": str(study_dir),
+            "comparison_only": True,
+            "source": None,
+            "test_f1": None,
+            "metrics": None,
+        }
+        if final_metrics_path.exists():
+            payload = _load_json(final_metrics_path)
+            metrics = payload.get("metrics_tuned_threshold") or payload.get("test_metrics") or {}
+            item.update(
+                {
+                    "source": str(final_metrics_path),
+                    "threshold": payload.get("tuned_threshold") or metrics.get("threshold"),
+                    "test_f1": metrics.get("f1"),
+                    "metrics": metrics,
+                }
+            )
+        elif study_summary_path.exists():
+            payload = _load_json(study_summary_path)
+            metrics = payload.get("final_results", {}).get("test_metrics", {})
+            item.update(
+                {
+                    "source": str(study_summary_path),
+                    "threshold": metrics.get("threshold"),
+                    "test_f1": metrics.get("f1"),
+                    "metrics": metrics,
+                }
+            )
+        comparisons.append(item)
+    return comparisons
+
+
+def _calibration_summary(members: list[dict[str, Any]], ensemble_oof_prob: np.ndarray, oof_y_true: list[int]) -> dict[str, Any]:
+    member_metrics = [
+        {
+            "member": member["name"],
+            "study_dir": str(member["study_dir"]),
+            "trial_number": int(member["trial_number"]),
+            **(member["oof_payload"].get("calibration_metrics", {}) or {}),
+        }
+        for member in members
+    ]
+
+    def values_for(key: str) -> list[float]:
+        values: list[float] = []
+        for item in member_metrics:
+            value = item.get(key)
+            if value is not None and np.isfinite(float(value)):
+                values.append(float(value))
+        return values
+
+    def mean_for(key: str) -> float:
+        values = values_for(key)
+        return float(np.mean(values)) if values else float("nan")
+
     return {
-        "val_y_true": val_preds["y_true"],
-        "val_y_prob": apply_temperature(val_logits, temperature).tolist(),
-        "test_y_true": test_preds["y_true"],
-        "test_y_prob": apply_temperature(test_logits, temperature).tolist(),
+        "ensemble_oof_ece_calibrated": expected_calibration_error(ensemble_oof_prob, oof_y_true),
+        "pooled_ece_before_temperature": mean_for("ece_before_temperature"),
+        "pooled_ece_after_temperature": mean_for("ece_after_temperature"),
+        "pooled_ece_after_pooled_isotonic": mean_for("ece_after_pooled_isotonic"),
+        "pooled_ece_by_member": {
+            "before_temperature": {
+                item["member"]: item.get("ece_before_temperature") for item in member_metrics
+            },
+            "after_temperature": {
+                item["member"]: item.get("ece_after_temperature") for item in member_metrics
+            },
+            "after_pooled_isotonic": {
+                item["member"]: item.get("ece_after_pooled_isotonic") for item in member_metrics
+            },
+        },
+        "members": member_metrics,
     }
+
+
+def _interpretation_text(
+    threshold_name: str,
+    threshold_value: float,
+    probability_mode: str,
+    probability_mode_reason: str,
+    seed: int,
+    threshold_n_bootstrap: int,
+    test_ci_n_bootstrap: int,
+    oof_calibration: dict[str, Any],
+    test_metrics: dict[str, float],
+    comparisons: list[dict[str, Any]],
+) -> str:
+    final_f1 = float(test_metrics.get("f1", float("nan")))
+    best_baseline = max(
+        [float(item["test_f1"]) for item in comparisons if item.get("test_f1") is not None],
+        default=float("nan"),
+    )
+    ece = float(oof_calibration.get("ensemble_oof_ece_calibrated", float("nan")))
+    ece_ok = bool(np.isfinite(ece) and ece < 0.10)
+    improved = bool(np.isfinite(final_f1) and np.isfinite(best_baseline) and final_f1 > best_baseline)
+    target_hit = bool(np.isfinite(final_f1) and final_f1 >= 0.74)
+
+    lines = [
+        "OOF Ensemble Interpretation",
+        "===========================",
+        f"- Probability mode: {probability_mode} ({probability_mode_reason}).",
+        f"- Bootstrap/random seed for ensemble thresholding and test CIs: {seed}.",
+        f"- Bootstrap budgets: OOF threshold selection n={threshold_n_bootstrap}, test CI n={test_ci_n_bootstrap}.",
+        f"- Locked threshold: {threshold_name} = {threshold_value:.4f}, selected from calibrated OOF predictions only.",
+        "- The test set was evaluated once with the locked OOF threshold.",
+        "- No test-set tuning was performed for threshold, ensemble weights, probability mode, member choice, or model selection.",
+        f"- Pooled calibrated OOF ECE = {ece:.4f}; target < 0.10 was {'reached' if ece_ok else 'not reached'}.",
+        f"- Final test F1 = {final_f1:.4f}.",
+    ]
+    if np.isfinite(best_baseline):
+        lines.append(
+            f"- Best comparison-only single-model tuned F1 = {best_baseline:.4f}; "
+            f"the ensemble {'improved over it' if improved else 'did not improve over it'}."
+        )
+    else:
+        lines.append("- Single-model baseline F1 was unavailable for comparison.")
+    lines.append(f"- Target test F1 >= 0.74 was {'reached' if target_hit else 'not reached'}.")
+    if not target_hit:
+        lines.append(
+            "- The target was not reached; likely causes are residual fold disagreement, calibration stair-stepping, "
+            "and limited anomaly support. The threshold, members, weights, and probability mode were left unchanged."
+        )
+    return "\n".join(lines) + "\n"
+
+
+def run_oof_ensemble(
+    study_dirs: list[Path],
+    trial_numbers: list[int],
+    output_dir: Path,
+    probability_mode: str = "arithmetic",
+    threshold_name: str = "f1_threshold",
+    force: bool = False,
+    skip_existing: bool = False,
+    device_name: str = "auto",
+    n_bootstrap: int = 1000,
+    test_ci_n_bootstrap: int = 1000,
+    seed: int = 42,
+) -> dict[str, Any]:
+    if len(study_dirs) != len(trial_numbers):
+        raise ValueError("--study-dirs and --trial-numbers must have the same length.")
+    if len(study_dirs) < 2:
+        raise ValueError("At least two study/trial pairs are required for this ensemble.")
+    if probability_mode not in {"arithmetic", "logit"}:
+        raise ValueError("probability_mode must be 'arithmetic' or 'logit'.")
+    if int(n_bootstrap) <= 0:
+        raise ValueError("n_bootstrap must be positive.")
+    if int(test_ci_n_bootstrap) <= 0:
+        raise ValueError("test_ci_n_bootstrap must be positive.")
+
+    output_dir = Path(output_dir)
+    expected_outputs = [
+        output_dir / "ensemble_predictions.json",
+        output_dir / "oof_thresholds.json",
+        output_dir / "final_test_metrics.json",
+        output_dir / "test_confidence_intervals.json",
+        output_dir / "interpretation.txt",
+    ]
+    if skip_existing and not force and all(path.exists() for path in expected_outputs):
+        print(f"  Skipping existing ensemble outputs in {output_dir}")
+        return {"output_dir": str(output_dir), "skipped": True}
+    if not force and not skip_existing and any(path.exists() for path in expected_outputs):
+        raise FileExistsError(f"{output_dir} already contains ensemble outputs; use --force to overwrite.")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    members: list[dict[str, Any]] = []
+    for study_dir, trial_number in zip(study_dirs, trial_numbers):
+        name = _member_name(study_dir, trial_number)
+        print(f"  Member {name}: loading/generating OOF predictions")
+        oof_payload = load_or_generate_oof_predictions(
+            study_dir=study_dir,
+            trial_number=int(trial_number),
+            force=force,
+            device_name=device_name,
+            n_bootstrap=n_bootstrap,
+            quiet=False,
+        )
+        print(f"  Member {name}: generating calibrated fold-averaged test predictions")
+        test_payload = predict_trial_test_from_folds(
+            study_dir=study_dir,
+            trial_number=int(trial_number),
+            oof_payload=oof_payload,
+            device_name=device_name,
+            quiet=False,
+        )
+        members.append(
+            {
+                "name": name,
+                "study_dir": Path(study_dir),
+                "trial_number": int(trial_number),
+                "oof_payload": oof_payload,
+                "test_payload": test_payload,
+            }
+        )
+
+    oof_ids, oof_y_true, oof_member_probs, oof_stack = _align_oof_members(members)
+    test_ids, test_y_true, test_member_probs, test_stack = _align_test_members(members)
+
+    ensemble_oof_prob = _combine_probabilities(oof_stack, probability_mode)
+    ensemble_test_prob = _combine_probabilities(test_stack, probability_mode)
+    thresholds = compute_oof_thresholds(
+        y_true=oof_y_true,
+        y_prob=ensemble_oof_prob,
+        seed=seed,
+        n_bootstrap=n_bootstrap,
+    )
+    if threshold_name not in thresholds:
+        raise ValueError(f"Unknown threshold name '{threshold_name}'. Expected one of {sorted(thresholds)}.")
+    locked_threshold = float(thresholds[threshold_name]["selected_threshold"])
+
+    test_metrics_locked = compute_binary_classification_metrics(
+        test_y_true,
+        ensemble_test_prob.tolist(),
+        threshold=locked_threshold,
+    )
+    test_metrics_fixed = compute_binary_classification_metrics(
+        test_y_true,
+        ensemble_test_prob.tolist(),
+        threshold=0.5,
+    )
+    test_ci = bootstrap_confidence_intervals(
+        test_y_true,
+        ensemble_test_prob.tolist(),
+        threshold=locked_threshold,
+        n_bootstrap=test_ci_n_bootstrap,
+        seed=seed,
+    )
+    comparisons = _load_single_model_comparisons([Path(path) for path in study_dirs])
+    probability_mode_reason = (
+        "explicit CLI setting; default is arithmetic and no test metrics were used"
+        if probability_mode == "arithmetic"
+        else "explicit CLI setting; no test metrics were used"
+    )
+    calibration_metrics = _calibration_summary(members, ensemble_oof_prob, oof_y_true)
+
+    ensemble_predictions = {
+        "test_ids": test_ids,
+        "y_true": test_y_true,
+        "per_member_calibrated_test_probabilities": test_member_probs,
+        "ensemble_test_probability": ensemble_test_prob.tolist(),
+        "oof_ids": oof_ids,
+        "oof_y_true": oof_y_true,
+        "per_member_calibrated_oof_probabilities": oof_member_probs,
+        "ensemble_oof_probability": ensemble_oof_prob.tolist(),
+        "probability_mode": probability_mode,
+        "probability_mode_reason": probability_mode_reason,
+        "seed": int(seed),
+        "threshold_n_bootstrap": int(n_bootstrap),
+        "test_ci_n_bootstrap": int(test_ci_n_bootstrap),
+        "selected_threshold_name": threshold_name,
+        "selected_threshold_value": locked_threshold,
+    }
+    oof_thresholds = {
+        "probability_mode": probability_mode,
+        "probability_mode_reason": probability_mode_reason,
+        "seed": int(seed),
+        "threshold_n_bootstrap": int(n_bootstrap),
+        "test_ci_n_bootstrap": int(test_ci_n_bootstrap),
+        "selected_threshold_name": threshold_name,
+        "selected_threshold_value": locked_threshold,
+        "f1_threshold": thresholds["f1_threshold"],
+        "clinical_threshold": thresholds["clinical_threshold"],
+        "calibration_metrics": calibration_metrics,
+    }
+    final_test_metrics = {
+        "locked_threshold": locked_threshold,
+        "selected_threshold_name": threshold_name,
+        "probability_mode": probability_mode,
+        "probability_mode_reason": probability_mode_reason,
+        "seed": int(seed),
+        "threshold_n_bootstrap": int(n_bootstrap),
+        "test_ci_n_bootstrap": int(test_ci_n_bootstrap),
+        "test_metrics_at_locked_oof_threshold": test_metrics_locked,
+        "comparison_metrics_at_threshold_0_5": test_metrics_fixed,
+        "single_model_best_run_comparison_only": comparisons,
+        "test_set_tuning_performed": False,
+    }
+
+    save_json(ensemble_predictions, output_dir / "ensemble_predictions.json")
+    save_json(oof_thresholds, output_dir / "oof_thresholds.json")
+    save_json(final_test_metrics, output_dir / "final_test_metrics.json")
+    save_json(
+        {
+            "locked_threshold": locked_threshold,
+            "selected_threshold_name": threshold_name,
+            "probability_mode": probability_mode,
+            "seed": int(seed),
+            "n_bootstrap": int(test_ci_n_bootstrap),
+            "test_ci_n_bootstrap": int(test_ci_n_bootstrap),
+            "threshold_n_bootstrap": int(n_bootstrap),
+            "confidence_intervals": test_ci,
+        },
+        output_dir / "test_confidence_intervals.json",
+    )
+    interpretation = _interpretation_text(
+        threshold_name=threshold_name,
+        threshold_value=locked_threshold,
+        probability_mode=probability_mode,
+        probability_mode_reason=probability_mode_reason,
+        seed=seed,
+        threshold_n_bootstrap=n_bootstrap,
+        test_ci_n_bootstrap=test_ci_n_bootstrap,
+        oof_calibration=calibration_metrics,
+        test_metrics=test_metrics_locked,
+        comparisons=comparisons,
+    )
+    (output_dir / "interpretation.txt").write_text(interpretation)
+
+    print(
+        "  Ensemble "
+        f"mode={probability_mode} threshold={locked_threshold:.4f} "
+        f"F1={test_metrics_locked.get('f1', float('nan')):.4f} "
+        f"ROC-AUC={test_metrics_locked.get('roc_auc', float('nan')):.4f} "
+        f"PR-AUC={test_metrics_locked.get('pr_auc', float('nan')):.4f}"
+    )
+    return {
+        "output_dir": str(output_dir),
+        "test_metrics": test_metrics_locked,
+        "threshold": locked_threshold,
+        "probability_mode": probability_mode,
+        "seed": int(seed),
+        "threshold_n_bootstrap": int(n_bootstrap),
+        "test_ci_n_bootstrap": int(test_ci_n_bootstrap),
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="OOF-locked calibrated ensemble over explicit CV trials.")
+    parser.add_argument("--study-dirs", type=Path, nargs="+", required=True)
+    parser.add_argument("--trial-numbers", type=int, nargs="+", required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--probability-mode", choices=["arithmetic", "logit"], default="arithmetic")
+    parser.add_argument("--threshold-name", choices=["f1_threshold", "clinical_threshold"], default="f1_threshold")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--n-bootstrap", type=int, default=1000,
+                        help="Bootstrap samples for OOF threshold selection.")
+    parser.add_argument("--test-ci-n-bootstrap", type=int, default=1000,
+                        help="Bootstrap samples for final test confidence intervals.")
+    parser.add_argument("--seed", type=int, default=42)
+    return parser.parse_args()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Top-K soft-voting ensemble over Optuna trials.")
-    parser.add_argument("--study-dir", type=Path, required=True,
-                        help="Optuna study directory (contains leaderboard.json and trial_XXX folders).")
-    parser.add_argument("--top-k", type=int, default=5)
-    parser.add_argument("--output-dir", type=Path, default=None,
-                        help="Where to save ensemble metrics (defaults to <study-dir>/ensemble_topk).")
-    args = parser.parse_args()
-
-    study_dir: Path = args.study_dir
-    leaderboard = _load_json(study_dir / "leaderboard.json")
-    leaderboard = [entry for entry in leaderboard if entry.get("score") is not None]
-    leaderboard.sort(key=lambda entry: float(entry["score"]), reverse=True)
-    top_k = leaderboard[: max(1, args.top_k)]
-
-    output_dir: Path = args.output_dir or (study_dir / "ensemble_topk")
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    device = resolve_device("auto")
-    print(f"  Ensembling top-{len(top_k)} trials into {output_dir}")
-
-    test_prob_stack: list[np.ndarray] = []
-    val_prob_stack: list[np.ndarray] = []
-    test_y_true: list[float] | None = None
-    val_y_true: list[float] | None = None
-    used_trials: list[dict] = []
-
-    for entry in top_k:
-        trial_number = int(entry["trial_number"])
-        trial_dir = study_dir / f"trial_{trial_number:03d}"
-        if not (trial_dir / "best_model.pt").exists():
-            print(f"  [skip] trial {trial_number:03d}: checkpoint missing")
-            continue
-        print(f"  [run]  trial {trial_number:03d}  score={entry['score']:.4f}")
-        preds = _run_trial_inference(trial_dir, device)
-        test_prob_stack.append(np.asarray(preds["test_y_prob"]))
-        val_prob_stack.append(np.asarray(preds["val_y_prob"]))
-        test_y_true = preds["test_y_true"]
-        val_y_true = preds["val_y_true"]
-        used_trials.append({"trial_number": trial_number, "score": entry["score"]})
-
-    if not test_prob_stack or test_y_true is None or val_y_true is None:
-        raise RuntimeError("No usable trial checkpoints found in the study directory.")
-
-    ensemble_test_prob = np.mean(np.stack(test_prob_stack, axis=0), axis=0)
-    ensemble_val_prob = np.mean(np.stack(val_prob_stack, axis=0), axis=0)
-
-    tuned_threshold = optimize_threshold(val_y_true, ensemble_val_prob.tolist(), method="youden")
-    fixed_threshold = 0.5
-
-    test_metrics_tuned = compute_binary_classification_metrics(
-        test_y_true, ensemble_test_prob.tolist(), threshold=tuned_threshold,
+    args = parse_args()
+    run_oof_ensemble(
+        study_dirs=args.study_dirs,
+        trial_numbers=args.trial_numbers,
+        output_dir=args.output_dir,
+        probability_mode=args.probability_mode,
+        threshold_name=args.threshold_name,
+        force=args.force,
+        skip_existing=args.skip_existing,
+        device_name=args.device,
+        n_bootstrap=args.n_bootstrap,
+        test_ci_n_bootstrap=args.test_ci_n_bootstrap,
+        seed=args.seed,
     )
-    test_metrics_fixed = compute_binary_classification_metrics(
-        test_y_true, ensemble_test_prob.tolist(), threshold=fixed_threshold,
-    )
-    test_ci = bootstrap_confidence_intervals(
-        test_y_true, ensemble_test_prob.tolist(), threshold=tuned_threshold,
-    )
-
-    payload = {
-        "trials": used_trials,
-        "tuned_threshold": tuned_threshold,
-        "fixed_threshold": fixed_threshold,
-        "test_metrics_tuned_threshold": test_metrics_tuned,
-        "test_metrics_fixed_threshold": test_metrics_fixed,
-        "test_confidence_intervals": test_ci,
-    }
-    save_json(payload, output_dir / "ensemble_metrics.json")
-    save_json(
-        {
-            "y_true": list(test_y_true),
-            "y_prob_ensemble": ensemble_test_prob.tolist(),
-            "val_y_true": list(val_y_true),
-            "val_y_prob_ensemble": ensemble_val_prob.tolist(),
-            "per_trial_test_probs": [p.tolist() for p in test_prob_stack],
-        },
-        output_dir / "ensemble_predictions.json",
-    )
-    print(f"  Ensemble tuned_thresh={tuned_threshold:.4f}  "
-          f"ROC-AUC={test_metrics_tuned.get('roc_auc', float('nan')):.4f}  "
-          f"PR-AUC={test_metrics_tuned.get('pr_auc', float('nan')):.4f}  "
-          f"F1={test_metrics_tuned.get('f1', float('nan')):.4f}")
 
 
 if __name__ == "__main__":

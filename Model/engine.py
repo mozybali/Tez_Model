@@ -443,7 +443,7 @@ def collect_predictions(
     device: torch.device,
     tabular_feature_stats: dict[str, float] | None = None,
     tta_enabled: bool = False,
-) -> dict[str, list[float]]:
+) -> dict[str, list[float] | list[str]]:
     """Run inference and return y_true / y_logit / y_prob lists.
 
     When ``tta_enabled`` is True, we average logits across identity and spatial
@@ -454,9 +454,19 @@ def collect_predictions(
     y_true: list[float] = []
     y_prob: list[float] = []
     y_logit: list[float] = []
+    ids: list[str] = []
     flip_dims_list = _TTA_FLIP_DIMS if tta_enabled else ((),)
     with torch.inference_mode():
         for batch in dataloader:
+            if "id" in batch:
+                batch_ids = batch["id"]
+                if isinstance(batch_ids, str):
+                    id_values = [batch_ids]
+                elif isinstance(batch_ids, torch.Tensor):
+                    id_values = batch_ids.detach().cpu().tolist()
+                else:
+                    id_values = list(batch_ids)
+                ids.extend(str(value) for value in id_values)
             volumes = batch["volume"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True)
             tabular_features = None
@@ -475,7 +485,14 @@ def collect_predictions(
             y_prob.extend(probs if isinstance(probs, list) else [probs])
             ground = labels.detach().cpu().tolist()
             y_true.extend(ground if isinstance(ground, list) else [ground])
-    return {"y_true": y_true, "y_prob": y_prob, "y_logit": y_logit}
+    result: dict[str, list[float] | list[str]] = {
+        "y_true": y_true,
+        "y_prob": y_prob,
+        "y_logit": y_logit,
+    }
+    if ids:
+        result["id"] = ids
+    return result
 
 
 def run_training(

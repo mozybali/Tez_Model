@@ -27,6 +27,17 @@ class TemperatureResult:
     ece_after: float
 
 
+@dataclass(frozen=True, slots=True)
+class ThresholdBootstrapResult:
+    threshold: float
+    median: float
+    ci_lower: float
+    ci_upper: float
+    thresholds: tuple[float, ...]
+    valid_bootstrap_samples: int
+    n_bootstrap: int
+
+
 def _sigmoid_np(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-x))
 
@@ -162,7 +173,8 @@ def select_threshold_bootstrap(
     beta: float = 1.0,
     min_specificity: float | None = None,
     min_precision: float | None = None,
-) -> float:
+    return_distribution: bool = False,
+) -> float | ThresholdBootstrapResult:
     """Bootstrap-averaged threshold selection — more stable than a single split.
 
     ``min_specificity`` / ``min_precision`` are forwarded to ``optimize_threshold``
@@ -174,6 +186,16 @@ def select_threshold_bootstrap(
     y_true_arr = np.asarray(y_true, dtype=np.int64).reshape(-1)
     y_prob_arr = np.asarray(y_prob, dtype=np.float64).reshape(-1)
     if len(np.unique(y_true_arr)) < 2:
+        if return_distribution:
+            return ThresholdBootstrapResult(
+                threshold=0.5,
+                median=0.5,
+                ci_lower=0.5,
+                ci_upper=0.5,
+                thresholds=(),
+                valid_bootstrap_samples=0,
+                n_bootstrap=int(n_bootstrap),
+            )
         return 0.5
 
     rng = np.random.RandomState(seed)
@@ -193,12 +215,36 @@ def select_threshold_bootstrap(
             )
         )
     if not thresholds:
-        return optimize_threshold(
+        fallback = optimize_threshold(
             y_true_arr.tolist(), y_prob_arr.tolist(),
             method=method, beta=beta,
             min_specificity=min_specificity, min_precision=min_precision,
         )
-    return float(np.median(thresholds))
+        if return_distribution:
+            return ThresholdBootstrapResult(
+                threshold=float(fallback),
+                median=float(fallback),
+                ci_lower=float(fallback),
+                ci_upper=float(fallback),
+                thresholds=(),
+                valid_bootstrap_samples=0,
+                n_bootstrap=int(n_bootstrap),
+            )
+        return float(fallback)
+
+    arr = np.asarray(thresholds, dtype=np.float64)
+    median = float(np.median(arr))
+    if return_distribution:
+        return ThresholdBootstrapResult(
+            threshold=median,
+            median=median,
+            ci_lower=float(np.percentile(arr, 2.5)),
+            ci_upper=float(np.percentile(arr, 97.5)),
+            thresholds=tuple(float(value) for value in arr.tolist()),
+            valid_bootstrap_samples=int(arr.size),
+            n_bootstrap=int(n_bootstrap),
+        )
+    return median
 
 
 @dataclass(frozen=True, slots=True)
