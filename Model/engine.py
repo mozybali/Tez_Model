@@ -513,422 +513,423 @@ def run_training(
     skip_test: bool = False,
     trial: object | None = None,
 ) -> dict[str, object]:
-    data_config = data_config.resolved()
-    output_dir = train_config.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-    seed_everything(train_config.seed)
+    model = optimizer = scheduler = criterion = dataloaders = None
+    try:
+        data_config = data_config.resolved()
+        output_dir = train_config.output_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+        seed_everything(train_config.seed)
 
-    device = resolve_device(train_config.device)
-    dataloaders, splits = build_dataloaders(
-        data_config=data_config,
-        augmentation_config=augmentation_config,
-        train_config=train_config,
-        device=device,
-    )
-    tabular_feature_stats = (
-        compute_tabular_feature_stats(splits["train"]) if model_config.use_tabular_features else None
-    )
-
-    model = build_model(
-        model_config=model_config,
-        num_tabular_features=len(TABULAR_FEATURE_NAMES) if model_config.use_tabular_features else 0,
-    ).to(device)
-
-    pos_weight = compute_pos_weight(splits["train"], train_config.pos_weight_strategy)
-    criterion = build_criterion(train_config, pos_weight, device)
-    optimizer = build_optimizer(model, train_config)
-    scheduler = build_scheduler(optimizer, train_config)
-
-    history: list[dict[str, object]] = []
-    best_score = float("-inf")
-    best_epoch = -1
-    best_val_metrics: dict[str, float] = {}
-    best_val_threshold = train_config.decision_threshold
-    best_checkpoint = output_dir / "best_model.pt"
-    patience_counter = 0
-
-    # Resolve threshold-selection knobs once so the per-epoch loop matches the
-    # CV fold loop. Without this, run_training's checkpoint selection used a
-    # hard-coded Youden threshold and never surfaced constrained_f1 — meaning
-    # --primary-metric constrained_f1 silently fell back to pr_auc and the
-    # selected best_model.pt could still be the "spam-positives" fold winner.
-    epoch_threshold_method = getattr(train_config, "threshold_selection", "youden")
-    epoch_threshold_beta = float(getattr(train_config, "threshold_fbeta", 1.0))
-    epoch_min_spec = getattr(train_config, "threshold_min_specificity", None)
-    epoch_min_prec = getattr(train_config, "threshold_min_precision", None)
-    epoch_constrained_f1_min_spec = getattr(
-        train_config, "constrained_f1_min_specificity", None,
-    )
-
-    for epoch in range(1, train_config.epochs + 1):
-        train_metrics = run_epoch(
-            model=model,
-            dataloader=dataloaders["train"],
-            criterion=criterion,
-            optimizer=optimizer,
+        device = resolve_device(train_config.device)
+        dataloaders, splits = build_dataloaders(
+            data_config=data_config,
+            augmentation_config=augmentation_config,
+            train_config=train_config,
             device=device,
-            amp_enabled=train_config.amp,
-            decision_threshold=train_config.decision_threshold,
-            tabular_feature_stats=tabular_feature_stats,
-            gradient_clip_norm=train_config.gradient_clip_norm,
         )
-        val_y_true, val_y_prob, val_loss = _run_epoch_raw(
-            model=model,
-            dataloader=dataloaders["val"],
-            criterion=criterion,
-            optimizer=None,
-            device=device,
-            amp_enabled=False,
-            tabular_feature_stats=tabular_feature_stats,
-        )
-        if epoch_threshold_method == "fixed":
-            val_threshold = float(train_config.decision_threshold)
-        else:
-            val_threshold = optimize_threshold(
-                val_y_true, val_y_prob,
-                method=epoch_threshold_method, beta=epoch_threshold_beta,
-                min_specificity=epoch_min_spec, min_precision=epoch_min_prec,
-            )
-        val_metrics = compute_binary_classification_metrics(
-            y_true=val_y_true, y_prob=val_y_prob, threshold=val_threshold,
-            constrained_f1_min_specificity=epoch_constrained_f1_min_spec,
-        )
-        val_metrics["loss"] = val_loss
-        score = select_model_score(val_metrics, primary_metric=train_config.primary_metric)
-        if trial is not None:
-            trial.report(float(score), step=epoch)
-            if trial.should_prune():
-                del model, optimizer, scheduler, criterion, dataloaders
-                release_gpu_memory()
-                _raise_trial_pruned(f"Pruned at epoch {epoch} with score={score:.4f}.")
-
-        entry = {"epoch": epoch, "train": train_metrics, "val": val_metrics, "score": score}
-        history.append(entry)
-
-        if scheduler is not None:
-            scheduler.step()
-
-        improved = score > best_score + train_config.early_stopping_min_delta
-        if improved:
-            best_score = score
-            best_epoch = epoch
-            best_val_metrics = val_metrics
-            best_val_threshold = val_threshold
-            patience_counter = 0
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "score": score,
-                },
-                best_checkpoint,
-            )
-            save_json(
-                {
-                    "epoch": epoch,
-                    "score": score,
-                    "data_config": to_serializable(data_config),
-                    "model_config": to_serializable(model_config),
-                    "train_config": to_serializable(train_config),
-                    "tabular_feature_names": list(TABULAR_FEATURE_NAMES),
-                    "tabular_feature_stats": tabular_feature_stats,
-                },
-                output_dir / "checkpoint_meta.json",
-            )
-        elif epoch > train_config.warmup_epochs:
-            patience_counter += 1
-
-        if not quiet:
-            marker = "*" if improved else " "
-            roc = val_metrics.get("roc_auc")
-            roc_str = f"{roc:.4f}" if roc is not None and not math.isnan(roc) else "N/A"
-            primary_label = f"val_{train_config.primary_metric}"
-            print(
-                f"  [{marker}] Epoch {epoch:03d}/{train_config.epochs:03d}  "
-                f"train_loss={train_metrics['loss']:.4f}  "
-                f"val_loss={val_metrics['loss']:.4f}  "
-                f"val_roc_auc={roc_str}  "
-                f"{primary_label}={score:.4f}  "
-                f"patience={patience_counter}/{train_config.early_stopping_patience}"
-            )
-
-        if patience_counter >= train_config.early_stopping_patience:
-            if not quiet:
-                print(f"  Early stopping at epoch {epoch}.")
-            break
-
-    # Load best checkpoint
-    if best_checkpoint.exists():
-        checkpoint = torch.load(best_checkpoint, map_location="cpu", weights_only=True)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        del checkpoint
-
-    # Collect validation predictions once; reuse for calibration, threshold selection, and plots.
-    tta_enabled = bool(getattr(train_config, "tta_enabled", False))
-    val_preds = collect_predictions(
-        model, dataloaders["val"], device, tabular_feature_stats, tta_enabled=tta_enabled,
-    )
-    val_logits_np = np.asarray(val_preds.get("y_logit") or logits_from_probs(np.asarray(val_preds["y_prob"])))
-    val_labels_np = np.asarray(val_preds["y_true"], dtype=np.float64)
-
-    # ── Post-hoc calibration on val ──────────────────────────────────
-    calibration_method = getattr(train_config, "calibration_method", "temperature").lower()
-    use_temperature = (
-        getattr(train_config, "calibrate_temperature", True)
-        and "temperature" in calibration_method
-    )
-    use_isotonic = "isotonic" in calibration_method
-
-    calibration_summary: dict[str, float] = {}
-    temperature = 1.0
-    if use_temperature:
-        temp_result = fit_temperature(val_logits_np, val_labels_np)
-        temperature = float(temp_result.temperature)
-        calibration_summary = {
-            "temperature": temperature,
-            "nll_before": temp_result.nll_before,
-            "nll_after": temp_result.nll_after,
-            "ece_before": temp_result.ece_before,
-            "ece_after": temp_result.ece_after,
-        }
-        if not quiet:
-            print(
-                f"  Temperature scaling: T={temperature:.4f}  "
-                f"ECE {temp_result.ece_before:.4f} -> {temp_result.ece_after:.4f}"
-            )
-
-    val_probs_after_temp = apply_temperature(val_logits_np, temperature)
-
-    isotonic_result = None
-    isotonic_min_samples = int(getattr(train_config, "isotonic_min_samples", 0) or 0)
-    val_n = int(val_labels_np.shape[0])
-    if use_isotonic and val_n < isotonic_min_samples:
-        if not quiet:
-            print(
-                f"  Isotonic calibration skipped: val n={val_n} < "
-                f"isotonic_min_samples={isotonic_min_samples} "
-                f"(would overfit to a near-zero ECE on a tiny split)."
-            )
-        calibration_summary.update({
-            "isotonic_skipped_reason": (
-                f"val_n={val_n} < isotonic_min_samples={isotonic_min_samples}"
-            ),
-        })
-        use_isotonic = False
-    if use_isotonic:
-        isotonic_result = fit_isotonic(val_probs_after_temp, val_labels_np)
-        calibration_summary.update({
-            "isotonic_ece_before": isotonic_result.ece_before,
-            "isotonic_ece_after": isotonic_result.ece_after,
-        })
-        if not quiet:
-            print(
-                f"  Isotonic calibration: ECE "
-                f"{isotonic_result.ece_before:.4f} -> {isotonic_result.ece_after:.4f}"
-            )
-        val_probs_cal = apply_isotonic(val_probs_after_temp, isotonic_result)
-    else:
-        val_probs_cal = val_probs_after_temp
-
-    # ── Threshold selection: fixed, single-split, and bootstrap-median ──
-    threshold_method = getattr(train_config, "threshold_selection", "youden")
-    threshold_beta = float(getattr(train_config, "threshold_fbeta", 1.0))
-    threshold_min_spec = getattr(train_config, "threshold_min_specificity", None)
-    threshold_min_prec = getattr(train_config, "threshold_min_precision", None)
-    constrained_f1_min_spec = getattr(train_config, "constrained_f1_min_specificity", None)
-    fixed_threshold = float(train_config.decision_threshold)
-    if threshold_method == "fixed":
-        optimal_threshold = fixed_threshold
-    else:
-        optimal_threshold = select_threshold_bootstrap(
-            val_preds["y_true"], val_probs_cal.tolist(),
-            method=threshold_method, seed=train_config.seed, beta=threshold_beta,
-            min_specificity=threshold_min_spec, min_precision=threshold_min_prec,
-        )
-    if not quiet:
-        print(
-            f"  Threshold — fixed: {fixed_threshold:.4f}  "
-            f"bootstrap_{threshold_method}: {optimal_threshold:.4f}"
+        tabular_feature_stats = (
+            compute_tabular_feature_stats(splits["train"]) if model_config.use_tabular_features else None
         )
 
-    # Store val metrics at both thresholds (calibrated probabilities)
-    val_metrics_fixed = compute_binary_classification_metrics(
-        val_preds["y_true"], val_probs_cal.tolist(), threshold=fixed_threshold,
-        constrained_f1_min_specificity=constrained_f1_min_spec,
-    )
-    val_metrics_tuned = compute_binary_classification_metrics(
-        val_preds["y_true"], val_probs_cal.tolist(), threshold=optimal_threshold,
-        constrained_f1_min_specificity=constrained_f1_min_spec,
-    )
+        model = build_model(
+            model_config=model_config,
+            num_tabular_features=len(TABULAR_FEATURE_NAMES) if model_config.use_tabular_features else 0,
+        ).to(device)
 
-    # Reliability diagram data for plots
-    reliability_uncal = reliability_bins(val_preds["y_prob"], val_preds["y_true"])
-    reliability_cal = reliability_bins(val_probs_cal.tolist(), val_preds["y_true"])
-    calibration_payload = {
-        "temperature": temperature,
-        "calibration_method": calibration_method,
-        "summary": calibration_summary,
-        "ece_val_uncalibrated": expected_calibration_error(val_preds["y_prob"], val_preds["y_true"]),
-        "ece_val_calibrated": expected_calibration_error(val_probs_cal.tolist(), val_preds["y_true"]),
-        "reliability_uncalibrated": reliability_uncal,
-        "reliability_calibrated": reliability_cal,
-        "val_metrics_fixed_threshold": val_metrics_fixed,
-        "val_metrics_tuned_threshold": val_metrics_tuned,
-        "fixed_threshold": fixed_threshold,
-        "tuned_threshold": optimal_threshold,
-        "tta_enabled": tta_enabled,
-        "val_y_true": val_preds["y_true"],
-        "val_y_prob_uncalibrated": val_preds["y_prob"],
-        "val_y_prob_calibrated": val_probs_cal.tolist(),
-    }
-    if isotonic_result is not None:
-        calibration_payload["isotonic_x"] = list(isotonic_result.x)
-        calibration_payload["isotonic_y"] = list(isotonic_result.y)
-    save_json(calibration_payload, output_dir / "calibration.json")
+        pos_weight = compute_pos_weight(splits["train"], train_config.pos_weight_strategy)
+        criterion = build_criterion(train_config, pos_weight, device)
+        optimizer = build_optimizer(model, train_config)
+        scheduler = build_scheduler(optimizer, train_config)
 
-    test_metrics: dict[str, float] = {}
-    test_metrics_fixed: dict[str, float] = {}
-    test_ci: dict = {}
-    test_payload: dict = {}
-    test_eval_error: str | None = None
+        history: list[dict[str, object]] = []
+        best_score = float("-inf")
+        best_epoch = -1
+        best_val_metrics: dict[str, float] = {}
+        best_val_threshold = train_config.decision_threshold
+        best_checkpoint = output_dir / "best_model.pt"
+        patience_counter = 0
 
-    if not skip_test:
-        # Test eval can crash on Windows with OpenBLAS memory-allocation errors
-        # mid-bootstrap; guard the whole block so the trained checkpoint and
-        # calibration artifacts aren't lost when it does.
-        try:
-            # Raw test predictions, then apply calibration for reported metrics.
-            test_preds = collect_predictions(
-                model, dataloaders["test"], device, tabular_feature_stats, tta_enabled=tta_enabled,
+        # Resolve threshold-selection knobs once so the per-epoch loop matches the
+        # CV fold loop. Without this, run_training's checkpoint selection used a
+        # hard-coded Youden threshold and never surfaced constrained_f1 — meaning
+        # --primary-metric constrained_f1 silently fell back to pr_auc and the
+        # selected best_model.pt could still be the "spam-positives" fold winner.
+        epoch_threshold_method = getattr(train_config, "threshold_selection", "youden")
+        epoch_threshold_beta = float(getattr(train_config, "threshold_fbeta", 1.0))
+        epoch_min_spec = getattr(train_config, "threshold_min_specificity", None)
+        epoch_min_prec = getattr(train_config, "threshold_min_precision", None)
+        epoch_constrained_f1_min_spec = getattr(
+            train_config, "constrained_f1_min_specificity", None,
+        )
+
+        for epoch in range(1, train_config.epochs + 1):
+            train_metrics = run_epoch(
+                model=model,
+                dataloader=dataloaders["train"],
+                criterion=criterion,
+                optimizer=optimizer,
+                device=device,
+                amp_enabled=train_config.amp,
+                decision_threshold=train_config.decision_threshold,
+                tabular_feature_stats=tabular_feature_stats,
+                gradient_clip_norm=train_config.gradient_clip_norm,
             )
-            test_logits_np = np.asarray(
-                test_preds.get("y_logit") or logits_from_probs(np.asarray(test_preds["y_prob"]))
-            )
-            test_probs_after_temp = apply_temperature(test_logits_np, temperature)
-            if isotonic_result is not None:
-                test_probs_cal = apply_isotonic(test_probs_after_temp, isotonic_result)
-            else:
-                test_probs_cal = test_probs_after_temp
-
-            # Compute loss on the test set (AMP off for numerical parity).
-            _, _, test_loss = _run_epoch_raw(
-                model=model, dataloader=dataloaders["test"], criterion=criterion,
-                optimizer=None, device=device, amp_enabled=False,
+            val_y_true, val_y_prob, val_loss = _run_epoch_raw(
+                model=model,
+                dataloader=dataloaders["val"],
+                criterion=criterion,
+                optimizer=None,
+                device=device,
+                amp_enabled=False,
                 tabular_feature_stats=tabular_feature_stats,
             )
-
-            test_metrics_fixed = compute_binary_classification_metrics(
-                test_preds["y_true"], test_probs_cal.tolist(), threshold=fixed_threshold,
-                constrained_f1_min_specificity=constrained_f1_min_spec,
-            )
-            test_metrics_fixed["loss"] = test_loss
-            test_metrics = compute_binary_classification_metrics(
-                test_preds["y_true"], test_probs_cal.tolist(), threshold=optimal_threshold,
-                constrained_f1_min_specificity=constrained_f1_min_spec,
-            )
-            test_metrics["loss"] = test_loss
-
-            test_payload = {
-                "y_true": test_preds["y_true"],
-                "y_prob_uncalibrated": test_preds["y_prob"],
-                "y_prob_calibrated": test_probs_cal.tolist(),
-                "temperature": temperature,
-                "fixed_threshold": fixed_threshold,
-                "tuned_threshold": optimal_threshold,
-                "ece_uncalibrated": expected_calibration_error(test_preds["y_prob"], test_preds["y_true"]),
-                "ece_calibrated": expected_calibration_error(test_probs_cal.tolist(), test_preds["y_true"]),
-            }
-
-            # Bootstrap CI is the most BLAS-allocation-heavy step; isolate it so
-            # a crash here still leaves us with the point-estimate test metrics.
-            try:
-                test_ci = bootstrap_confidence_intervals(
-                    test_preds["y_true"], test_probs_cal.tolist(),
-                    threshold=optimal_threshold, seed=train_config.seed,
+            if epoch_threshold_method == "fixed":
+                val_threshold = float(train_config.decision_threshold)
+            else:
+                val_threshold = optimize_threshold(
+                    val_y_true, val_y_prob,
+                    method=epoch_threshold_method, beta=epoch_threshold_beta,
+                    min_specificity=epoch_min_spec, min_precision=epoch_min_prec,
                 )
-            except Exception as exc:
-                test_eval_error = f"bootstrap_ci_failed: {type(exc).__name__}: {exc}"
+            val_metrics = compute_binary_classification_metrics(
+                y_true=val_y_true, y_prob=val_y_prob, threshold=val_threshold,
+                constrained_f1_min_specificity=epoch_constrained_f1_min_spec,
+            )
+            val_metrics["loss"] = val_loss
+            score = select_model_score(val_metrics, primary_metric=train_config.primary_metric)
+            if trial is not None:
+                trial.report(float(score), step=epoch)
+                if trial.should_prune():
+                    _raise_trial_pruned(f"Pruned at epoch {epoch} with score={score:.4f}.")
+
+            entry = {"epoch": epoch, "train": train_metrics, "val": val_metrics, "score": score}
+            history.append(entry)
+
+            if scheduler is not None:
+                scheduler.step()
+
+            improved = score > best_score + train_config.early_stopping_min_delta
+            if improved:
+                best_score = score
+                best_epoch = epoch
+                best_val_metrics = val_metrics
+                best_val_threshold = val_threshold
+                patience_counter = 0
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "score": score,
+                    },
+                    best_checkpoint,
+                )
+                save_json(
+                    {
+                        "epoch": epoch,
+                        "score": score,
+                        "data_config": to_serializable(data_config),
+                        "model_config": to_serializable(model_config),
+                        "train_config": to_serializable(train_config),
+                        "tabular_feature_names": list(TABULAR_FEATURE_NAMES),
+                        "tabular_feature_stats": tabular_feature_stats,
+                    },
+                    output_dir / "checkpoint_meta.json",
+                )
+            elif epoch > train_config.warmup_epochs:
+                patience_counter += 1
+
+            if not quiet:
+                marker = "*" if improved else " "
+                roc = val_metrics.get("roc_auc")
+                roc_str = f"{roc:.4f}" if roc is not None and not math.isnan(roc) else "N/A"
+                primary_label = f"val_{train_config.primary_metric}"
+                print(
+                    f"  [{marker}] Epoch {epoch:03d}/{train_config.epochs:03d}  "
+                    f"train_loss={train_metrics['loss']:.4f}  "
+                    f"val_loss={val_metrics['loss']:.4f}  "
+                    f"val_roc_auc={roc_str}  "
+                    f"{primary_label}={score:.4f}  "
+                    f"patience={patience_counter}/{train_config.early_stopping_patience}"
+                )
+
+            if patience_counter >= train_config.early_stopping_patience:
                 if not quiet:
-                    print(f"  Warning: bootstrap CI failed ({exc}); continuing without it.")
-        except Exception as exc:
-            test_eval_error = f"test_eval_failed: {type(exc).__name__}: {exc}"
+                    print(f"  Early stopping at epoch {epoch}.")
+                break
+
+        # Load best checkpoint
+        if best_checkpoint.exists():
+            checkpoint = torch.load(best_checkpoint, map_location="cpu", weights_only=True)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            del checkpoint
+
+        # Collect validation predictions once; reuse for calibration, threshold selection, and plots.
+        tta_enabled = bool(getattr(train_config, "tta_enabled", False))
+        val_preds = collect_predictions(
+            model, dataloaders["val"], device, tabular_feature_stats, tta_enabled=tta_enabled,
+        )
+        val_logits_np = np.asarray(val_preds.get("y_logit") or logits_from_probs(np.asarray(val_preds["y_prob"])))
+        val_labels_np = np.asarray(val_preds["y_true"], dtype=np.float64)
+
+        # ── Post-hoc calibration on val ──────────────────────────────────
+        calibration_method = getattr(train_config, "calibration_method", "temperature").lower()
+        use_temperature = (
+            getattr(train_config, "calibrate_temperature", True)
+            and "temperature" in calibration_method
+        )
+        use_isotonic = "isotonic" in calibration_method
+
+        calibration_summary: dict[str, float] = {}
+        temperature = 1.0
+        if use_temperature:
+            temp_result = fit_temperature(val_logits_np, val_labels_np)
+            temperature = float(temp_result.temperature)
+            calibration_summary = {
+                "temperature": temperature,
+                "nll_before": temp_result.nll_before,
+                "nll_after": temp_result.nll_after,
+                "ece_before": temp_result.ece_before,
+                "ece_after": temp_result.ece_after,
+            }
             if not quiet:
-                print(f"  Warning: test evaluation failed ({exc}); saving training artifacts only.")
+                print(
+                    f"  Temperature scaling: T={temperature:.4f}  "
+                    f"ECE {temp_result.ece_before:.4f} -> {temp_result.ece_after:.4f}"
+                )
 
-    config_payload = {
-        "data": to_serializable(data_config),
-        "augmentation": to_serializable(augmentation_config),
-        "model": to_serializable(model_config),
-        "train": to_serializable(train_config),
-        "positive_class_weight": pos_weight,
-        "optimal_threshold": optimal_threshold,
-        "fixed_threshold": fixed_threshold,
-        "temperature": temperature,
-        "tabular_feature_names": list(TABULAR_FEATURE_NAMES) if model_config.use_tabular_features else [],
-        "tabular_feature_stats": tabular_feature_stats,
-        "test_eval_error": test_eval_error,
-    }
-    save_json(config_payload, output_dir / "config.json")
-    save_json({"history": history}, output_dir / "history.json")
-    save_json(best_val_metrics, output_dir / "best_val_metrics.json")
-    if test_metrics:
-        save_json(test_metrics, output_dir / "test_metrics.json")
-    if test_metrics_fixed:
-        save_json(test_metrics_fixed, output_dir / "test_metrics_fixed_threshold.json")
-    if test_payload:
-        save_json(test_payload, output_dir / "test_predictions.json")
-    if test_ci:
-        save_json(test_ci, output_dir / "test_confidence_intervals.json")
+        val_probs_after_temp = apply_temperature(val_logits_np, temperature)
 
-    if not quiet:
-        if test_metrics:
-            roc = test_metrics.get("roc_auc")
-            roc_str = f"{roc:.4f}" if roc is not None and not math.isnan(roc) else "N/A"
-            primary_value = test_metrics.get(train_config.primary_metric)
-            primary_str = (
-                f"{primary_value:.4f}"
-                if primary_value is not None and not math.isnan(primary_value)
-                else "N/A"
-            )
-            print(
-                f"  Best epoch: {best_epoch} | Test ROC-AUC: {roc_str} | "
-                f"Test {train_config.primary_metric}: {primary_str}"
-            )
-            if test_ci:
-                print("  Bootstrap 95% CI:")
-                for key, ci_vals in test_ci.items():
-                    print(f"    {key}: {ci_vals['mean']:.4f} [{ci_vals['ci_lower']:.4f}, {ci_vals['ci_upper']:.4f}]")
+        isotonic_result = None
+        isotonic_min_samples = int(getattr(train_config, "isotonic_min_samples", 0) or 0)
+        val_n = int(val_labels_np.shape[0])
+        if use_isotonic and val_n < isotonic_min_samples:
+            if not quiet:
+                print(
+                    f"  Isotonic calibration skipped: val n={val_n} < "
+                    f"isotonic_min_samples={isotonic_min_samples} "
+                    f"(would overfit to a near-zero ECE on a tiny split)."
+                )
+            calibration_summary.update({
+                "isotonic_skipped_reason": (
+                    f"val_n={val_n} < isotonic_min_samples={isotonic_min_samples}"
+                ),
+            })
+            use_isotonic = False
+        if use_isotonic:
+            isotonic_result = fit_isotonic(val_probs_after_temp, val_labels_np)
+            calibration_summary.update({
+                "isotonic_ece_before": isotonic_result.ece_before,
+                "isotonic_ece_after": isotonic_result.ece_after,
+            })
+            if not quiet:
+                print(
+                    f"  Isotonic calibration: ECE "
+                    f"{isotonic_result.ece_before:.4f} -> {isotonic_result.ece_after:.4f}"
+                )
+            val_probs_cal = apply_isotonic(val_probs_after_temp, isotonic_result)
         else:
-            print(f"  Best epoch: {best_epoch} | Test evaluation skipped")
+            val_probs_cal = val_probs_after_temp
 
-    history_path = output_dir / "history.json"
-    if history_path.exists():
-        try:
-            from Utils.plot_metrics import generate_plots
+        # ── Threshold selection: fixed, single-split, and bootstrap-median ──
+        threshold_method = getattr(train_config, "threshold_selection", "youden")
+        threshold_beta = float(getattr(train_config, "threshold_fbeta", 1.0))
+        threshold_min_spec = getattr(train_config, "threshold_min_specificity", None)
+        threshold_min_prec = getattr(train_config, "threshold_min_precision", None)
+        constrained_f1_min_spec = getattr(train_config, "constrained_f1_min_specificity", None)
+        fixed_threshold = float(train_config.decision_threshold)
+        if threshold_method == "fixed":
+            optimal_threshold = fixed_threshold
+        else:
+            optimal_threshold = select_threshold_bootstrap(
+                val_preds["y_true"], val_probs_cal.tolist(),
+                method=threshold_method, seed=train_config.seed, beta=threshold_beta,
+                min_specificity=threshold_min_spec, min_precision=threshold_min_prec,
+            )
+        if not quiet:
+            print(
+                f"  Threshold — fixed: {fixed_threshold:.4f}  "
+                f"bootstrap_{threshold_method}: {optimal_threshold:.4f}"
+            )
 
-            generate_plots(history_path, out_dir=output_dir)
-        except Exception as exc:
-            if not quiet:
-                print(f"  Warning: plot generation failed: {exc}")
+        # Store val metrics at both thresholds (calibrated probabilities)
+        val_metrics_fixed = compute_binary_classification_metrics(
+            val_preds["y_true"], val_probs_cal.tolist(), threshold=fixed_threshold,
+            constrained_f1_min_specificity=constrained_f1_min_spec,
+        )
+        val_metrics_tuned = compute_binary_classification_metrics(
+            val_preds["y_true"], val_probs_cal.tolist(), threshold=optimal_threshold,
+            constrained_f1_min_specificity=constrained_f1_min_spec,
+        )
 
-    result = {
-        "output_dir": str(output_dir),
-        "best_epoch": best_epoch,
-        "best_score": best_score,
-        "best_val_metrics": best_val_metrics,
-        "test_metrics": test_metrics,
-        "test_metrics_fixed_threshold": test_metrics_fixed,
-        "test_confidence_intervals": test_ci,
-        "optimal_threshold": optimal_threshold,
-        "fixed_threshold": fixed_threshold,
-        "temperature": temperature,
-        "checkpoint_path": str(best_checkpoint),
-        "test_eval_error": test_eval_error,
-    }
-    del model, optimizer, scheduler, criterion, dataloaders
-    release_gpu_memory()
-    return result
+        # Reliability diagram data for plots
+        reliability_uncal = reliability_bins(val_preds["y_prob"], val_preds["y_true"])
+        reliability_cal = reliability_bins(val_probs_cal.tolist(), val_preds["y_true"])
+        calibration_payload = {
+            "temperature": temperature,
+            "calibration_method": calibration_method,
+            "summary": calibration_summary,
+            "ece_val_uncalibrated": expected_calibration_error(val_preds["y_prob"], val_preds["y_true"]),
+            "ece_val_calibrated": expected_calibration_error(val_probs_cal.tolist(), val_preds["y_true"]),
+            "reliability_uncalibrated": reliability_uncal,
+            "reliability_calibrated": reliability_cal,
+            "val_metrics_fixed_threshold": val_metrics_fixed,
+            "val_metrics_tuned_threshold": val_metrics_tuned,
+            "fixed_threshold": fixed_threshold,
+            "tuned_threshold": optimal_threshold,
+            "tta_enabled": tta_enabled,
+            "val_y_true": val_preds["y_true"],
+            "val_y_prob_uncalibrated": val_preds["y_prob"],
+            "val_y_prob_calibrated": val_probs_cal.tolist(),
+        }
+        if isotonic_result is not None:
+            calibration_payload["isotonic_x"] = list(isotonic_result.x)
+            calibration_payload["isotonic_y"] = list(isotonic_result.y)
+        save_json(calibration_payload, output_dir / "calibration.json")
+
+        test_metrics: dict[str, float] = {}
+        test_metrics_fixed: dict[str, float] = {}
+        test_ci: dict = {}
+        test_payload: dict = {}
+        test_eval_error: str | None = None
+
+        if not skip_test:
+            # Test eval can crash on Windows with OpenBLAS memory-allocation errors
+            # mid-bootstrap; guard the whole block so the trained checkpoint and
+            # calibration artifacts aren't lost when it does.
+            try:
+                # Raw test predictions, then apply calibration for reported metrics.
+                test_preds = collect_predictions(
+                    model, dataloaders["test"], device, tabular_feature_stats, tta_enabled=tta_enabled,
+                )
+                test_logits_np = np.asarray(
+                    test_preds.get("y_logit") or logits_from_probs(np.asarray(test_preds["y_prob"]))
+                )
+                test_probs_after_temp = apply_temperature(test_logits_np, temperature)
+                if isotonic_result is not None:
+                    test_probs_cal = apply_isotonic(test_probs_after_temp, isotonic_result)
+                else:
+                    test_probs_cal = test_probs_after_temp
+
+                # Compute loss on the test set (AMP off for numerical parity).
+                _, _, test_loss = _run_epoch_raw(
+                    model=model, dataloader=dataloaders["test"], criterion=criterion,
+                    optimizer=None, device=device, amp_enabled=False,
+                    tabular_feature_stats=tabular_feature_stats,
+                )
+
+                test_metrics_fixed = compute_binary_classification_metrics(
+                    test_preds["y_true"], test_probs_cal.tolist(), threshold=fixed_threshold,
+                    constrained_f1_min_specificity=constrained_f1_min_spec,
+                )
+                test_metrics_fixed["loss"] = test_loss
+                test_metrics = compute_binary_classification_metrics(
+                    test_preds["y_true"], test_probs_cal.tolist(), threshold=optimal_threshold,
+                    constrained_f1_min_specificity=constrained_f1_min_spec,
+                )
+                test_metrics["loss"] = test_loss
+
+                test_payload = {
+                    "y_true": test_preds["y_true"],
+                    "y_prob_uncalibrated": test_preds["y_prob"],
+                    "y_prob_calibrated": test_probs_cal.tolist(),
+                    "temperature": temperature,
+                    "fixed_threshold": fixed_threshold,
+                    "tuned_threshold": optimal_threshold,
+                    "ece_uncalibrated": expected_calibration_error(test_preds["y_prob"], test_preds["y_true"]),
+                    "ece_calibrated": expected_calibration_error(test_probs_cal.tolist(), test_preds["y_true"]),
+                }
+
+                # Bootstrap CI is the most BLAS-allocation-heavy step; isolate it so
+                # a crash here still leaves us with the point-estimate test metrics.
+                try:
+                    test_ci = bootstrap_confidence_intervals(
+                        test_preds["y_true"], test_probs_cal.tolist(),
+                        threshold=optimal_threshold, seed=train_config.seed,
+                    )
+                except Exception as exc:
+                    test_eval_error = f"bootstrap_ci_failed: {type(exc).__name__}: {exc}"
+                    if not quiet:
+                        print(f"  Warning: bootstrap CI failed ({exc}); continuing without it.")
+            except Exception as exc:
+                test_eval_error = f"test_eval_failed: {type(exc).__name__}: {exc}"
+                if not quiet:
+                    print(f"  Warning: test evaluation failed ({exc}); saving training artifacts only.")
+
+        config_payload = {
+            "data": to_serializable(data_config),
+            "augmentation": to_serializable(augmentation_config),
+            "model": to_serializable(model_config),
+            "train": to_serializable(train_config),
+            "positive_class_weight": pos_weight,
+            "optimal_threshold": optimal_threshold,
+            "fixed_threshold": fixed_threshold,
+            "temperature": temperature,
+            "tabular_feature_names": list(TABULAR_FEATURE_NAMES) if model_config.use_tabular_features else [],
+            "tabular_feature_stats": tabular_feature_stats,
+            "test_eval_error": test_eval_error,
+        }
+        save_json(config_payload, output_dir / "config.json")
+        save_json({"history": history}, output_dir / "history.json")
+        save_json(best_val_metrics, output_dir / "best_val_metrics.json")
+        if test_metrics:
+            save_json(test_metrics, output_dir / "test_metrics.json")
+        if test_metrics_fixed:
+            save_json(test_metrics_fixed, output_dir / "test_metrics_fixed_threshold.json")
+        if test_payload:
+            save_json(test_payload, output_dir / "test_predictions.json")
+        if test_ci:
+            save_json(test_ci, output_dir / "test_confidence_intervals.json")
+
+        if not quiet:
+            if test_metrics:
+                roc = test_metrics.get("roc_auc")
+                roc_str = f"{roc:.4f}" if roc is not None and not math.isnan(roc) else "N/A"
+                primary_value = test_metrics.get(train_config.primary_metric)
+                primary_str = (
+                    f"{primary_value:.4f}"
+                    if primary_value is not None and not math.isnan(primary_value)
+                    else "N/A"
+                )
+                print(
+                    f"  Best epoch: {best_epoch} | Test ROC-AUC: {roc_str} | "
+                    f"Test {train_config.primary_metric}: {primary_str}"
+                )
+                if test_ci:
+                    print("  Bootstrap 95% CI:")
+                    for key, ci_vals in test_ci.items():
+                        print(f"    {key}: {ci_vals['mean']:.4f} [{ci_vals['ci_lower']:.4f}, {ci_vals['ci_upper']:.4f}]")
+            else:
+                print(f"  Best epoch: {best_epoch} | Test evaluation skipped")
+
+        history_path = output_dir / "history.json"
+        if history_path.exists():
+            try:
+                from Utils.plot_metrics import generate_plots
+
+                generate_plots(history_path, out_dir=output_dir)
+            except Exception as exc:
+                if not quiet:
+                    print(f"  Warning: plot generation failed: {exc}")
+
+        result = {
+            "output_dir": str(output_dir),
+            "best_epoch": best_epoch,
+            "best_score": best_score,
+            "best_val_metrics": best_val_metrics,
+            "test_metrics": test_metrics,
+            "test_metrics_fixed_threshold": test_metrics_fixed,
+            "test_confidence_intervals": test_ci,
+            "optimal_threshold": optimal_threshold,
+            "fixed_threshold": fixed_threshold,
+            "temperature": temperature,
+            "checkpoint_path": str(best_checkpoint),
+            "test_eval_error": test_eval_error,
+        }
+        return result
+    finally:
+        model = optimizer = scheduler = criterion = dataloaders = None
+        release_gpu_memory()
 
 
 def run_cross_validation(
@@ -971,199 +972,202 @@ def run_cross_validation(
     fold_results: list[dict] = []
 
     for fold_idx, (train_indices, val_indices) in enumerate(skf.split(cv_records, labels, groups)):
-        if not quiet:
-            print(f"\n{'='*60}")
-            print(f"  FOLD {fold_idx + 1}/{n_folds}")
-            print(f"{'='*60}")
+        model = optimizer = scheduler = criterion = dataloaders = datasets = None
+        try:
+            if not quiet:
+                print(f"\n{'='*60}")
+                print(f"  FOLD {fold_idx + 1}/{n_folds}")
+                print(f"{'='*60}")
 
-        fold_train = [cv_records[i] for i in train_indices]
-        fold_val = [cv_records[i] for i in val_indices]
+            fold_train = [cv_records[i] for i in train_indices]
+            fold_val = [cv_records[i] for i in val_indices]
 
-        fold_dir = output_dir / f"fold_{fold_idx + 1:02d}"
-        from dataclasses import replace as dc_replace
-        fold_train_config = dc_replace(train_config, output_dir=fold_dir)
-        fold_dir.mkdir(parents=True, exist_ok=True)
+            fold_dir = output_dir / f"fold_{fold_idx + 1:02d}"
+            from dataclasses import replace as dc_replace
+            fold_train_config = dc_replace(train_config, output_dir=fold_dir)
+            fold_dir.mkdir(parents=True, exist_ok=True)
 
-        # Build dataloaders manually for this fold
-        device = resolve_device(fold_train_config.device)
-        seed_everything(fold_train_config.seed + fold_idx)
+            # Build dataloaders manually for this fold
+            device = resolve_device(fold_train_config.device)
+            seed_everything(fold_train_config.seed + fold_idx)
 
-        if data_config.nan_strategy == "drop_record":
-            fold_train = [r for r in fold_train if not r.has_nan]
-            fold_val = [r for r in fold_val if not r.has_nan]
-            if not fold_train:
-                raise ValueError(
-                    f"All records in fold {fold_idx + 1} train split were dropped by nan_strategy='drop_record'."
-                )
-            if not fold_val:
-                raise ValueError(
-                    f"All records in fold {fold_idx + 1} val split were dropped by nan_strategy='drop_record'."
-                )
-
-        train_transform = build_train_augmentations(augmentation_config)
-        common_kwargs = dict(
-            target_shape=data_config.target_shape,
-            use_bbox_crop=data_config.use_bbox_crop,
-            bbox_margin=data_config.bbox_margin,
-            pad_to_cube_input=data_config.pad_to_cube,
-            canonicalize_right=data_config.canonicalize_right,
-            right_flip_axis=data_config.right_flip_axis,
-            nan_strategy=data_config.nan_strategy if data_config.nan_strategy != "drop_record" else "none",
-            nan_fill_value=data_config.nan_fill_value,
-            cache_mode=data_config.cache_mode,
-            cache_dir=data_config.cache_dir,
-        )
-
-        from Preprocessing.dataset import AlanKidneyDataset
-        datasets = {
-            "train": AlanKidneyDataset(records=fold_train, transform=train_transform, **common_kwargs),
-            "val": AlanKidneyDataset(records=fold_val, transform=None, **common_kwargs),
-        }
-        generator = torch.Generator().manual_seed(fold_train_config.seed + fold_idx)
-        pin_memory = effective_pin_memory(fold_train_config.pin_memory, device)
-
-        fold_sampler = None
-        fold_shuffle = True
-        if getattr(fold_train_config, "use_weighted_sampler", False):
-            fold_sampler = _build_weighted_sampler(
-                [int(r.label) for r in fold_train],
-                seed=fold_train_config.seed + fold_idx,
-            )
-            fold_shuffle = False
-
-        fold_persistent = fold_train_config.num_workers > 0
-        dataloaders = {
-            "train": DataLoader(
-                datasets["train"], batch_size=fold_train_config.batch_size,
-                shuffle=fold_shuffle, sampler=fold_sampler,
-                num_workers=fold_train_config.num_workers, pin_memory=pin_memory,
-                persistent_workers=fold_persistent,
-                prefetch_factor=2 if fold_persistent else None,
-                generator=generator if fold_sampler is None else None,
-            ),
-            "val": DataLoader(datasets["val"], batch_size=fold_train_config.batch_size, shuffle=False,
-                              num_workers=fold_train_config.num_workers, pin_memory=pin_memory,
-                              persistent_workers=fold_persistent,
-                              prefetch_factor=2 if fold_persistent else None),
-        }
-
-        tabular_feature_stats = (
-            compute_tabular_feature_stats(fold_train) if model_config.use_tabular_features else None
-        )
-        model = build_model(
-            model_config=model_config,
-            num_tabular_features=len(TABULAR_FEATURE_NAMES) if model_config.use_tabular_features else 0,
-        ).to(device)
-
-        pos_weight = compute_pos_weight(fold_train, fold_train_config.pos_weight_strategy)
-        criterion = build_criterion(fold_train_config, pos_weight, device)
-        optimizer = build_optimizer(model, fold_train_config)
-        scheduler = build_scheduler(optimizer, fold_train_config)
-
-        best_score = float("-inf")
-        best_epoch = -1
-        best_val_metrics: dict[str, float] = {}
-        best_checkpoint = fold_dir / "best_model.pt"
-        patience_counter = 0
-
-        for epoch in range(1, fold_train_config.epochs + 1):
-            train_metrics = run_epoch(model=model, dataloader=dataloaders["train"], criterion=criterion,
-                                      optimizer=optimizer, device=device, amp_enabled=fold_train_config.amp,
-                                      decision_threshold=fold_train_config.decision_threshold,
-                                      tabular_feature_stats=tabular_feature_stats,
-                                      gradient_clip_norm=fold_train_config.gradient_clip_norm)
-            val_y_true, val_y_prob, val_loss = _run_epoch_raw(
-                model=model, dataloader=dataloaders["val"], criterion=criterion,
-                optimizer=None, device=device, amp_enabled=False,
-                tabular_feature_stats=tabular_feature_stats,
-            )
-            # Honor the configured threshold method so CV scoring matches what
-            # run_training would deploy (e.g. fbeta when HPO optimizes F1).
-            fold_threshold_method = getattr(fold_train_config, "threshold_selection", "youden")
-            fold_threshold_beta = float(getattr(fold_train_config, "threshold_fbeta", 1.0))
-            fold_min_spec = getattr(fold_train_config, "threshold_min_specificity", None)
-            fold_min_prec = getattr(fold_train_config, "threshold_min_precision", None)
-            fold_constrained_f1_min_spec = getattr(
-                fold_train_config, "constrained_f1_min_specificity", None,
-            )
-            if fold_threshold_method == "fixed":
-                val_threshold = float(fold_train_config.decision_threshold)
-            else:
-                val_threshold = optimize_threshold(
-                    val_y_true, val_y_prob,
-                    method=fold_threshold_method, beta=fold_threshold_beta,
-                    min_specificity=fold_min_spec, min_precision=fold_min_prec,
-                )
-            val_metrics = compute_binary_classification_metrics(
-                y_true=val_y_true, y_prob=val_y_prob, threshold=val_threshold,
-                constrained_f1_min_specificity=fold_constrained_f1_min_spec,
-            )
-            val_metrics["loss"] = val_loss
-            score = select_model_score(val_metrics, primary_metric=fold_train_config.primary_metric)
-
-            if scheduler is not None:
-                scheduler.step()
-
-            if score > best_score + fold_train_config.early_stopping_min_delta:
-                best_score = score
-                best_epoch = epoch
-                best_val_metrics = val_metrics
-                patience_counter = 0
-                torch.save({"model_state_dict": model.state_dict()}, best_checkpoint)
-            elif epoch > fold_train_config.warmup_epochs:
-                patience_counter += 1
-
-            if patience_counter >= fold_train_config.early_stopping_patience:
-                break
-
-        fold_result = {
-            "fold": fold_idx + 1,
-            "best_epoch": best_epoch,
-            "best_score": best_score,
-            "best_val_metrics": best_val_metrics,
-        }
-        fold_results.append(fold_result)
-        save_json(fold_result, fold_dir / "fold_result.json")
-
-        prune_message = None
-        if trial is not None:
-            primary = train_config.primary_metric
-            running_scores = [
-                fr["best_val_metrics"].get(primary)
-                for fr in fold_results
-            ]
-            running_scores = [
-                float(score) for score in running_scores
-                if score is not None and not (isinstance(score, float) and math.isnan(score))
-            ]
-            if running_scores:
-                running_mean = float(np.mean(running_scores))
-                running_std = float(np.std(running_scores)) if len(running_scores) > 1 else 0.0
-                penalty = float(getattr(train_config, "cv_score_std_penalty", 0.0) or 0.0)
-                trial.report(running_mean - penalty * running_std, step=fold_idx + 1)
-                if trial.should_prune():
-                    prune_message = (
-                        f"Pruned after fold {fold_idx + 1} with running_mean={running_mean:.4f}."
+            if data_config.nan_strategy == "drop_record":
+                fold_train = [r for r in fold_train if not r.has_nan]
+                fold_val = [r for r in fold_val if not r.has_nan]
+                if not fold_train:
+                    raise ValueError(
+                        f"All records in fold {fold_idx + 1} train split were dropped by nan_strategy='drop_record'."
+                    )
+                if not fold_val:
+                    raise ValueError(
+                        f"All records in fold {fold_idx + 1} val split were dropped by nan_strategy='drop_record'."
                     )
 
-        if not quiet:
-            roc = best_val_metrics.get("roc_auc")
-            roc_str = f"{roc:.4f}" if roc is not None and not math.isnan(roc) else "N/A"
-            primary_value = best_val_metrics.get(fold_train_config.primary_metric)
-            primary_str = (
-                f"{primary_value:.4f}"
-                if primary_value is not None and not math.isnan(primary_value)
-                else "N/A"
-            )
-            print(
-                f"  Fold {fold_idx + 1} | Best epoch: {best_epoch} | "
-                f"Val ROC-AUC: {roc_str} | Val {fold_train_config.primary_metric}: {primary_str}"
+            train_transform = build_train_augmentations(augmentation_config)
+            common_kwargs = dict(
+                target_shape=data_config.target_shape,
+                use_bbox_crop=data_config.use_bbox_crop,
+                bbox_margin=data_config.bbox_margin,
+                pad_to_cube_input=data_config.pad_to_cube,
+                canonicalize_right=data_config.canonicalize_right,
+                right_flip_axis=data_config.right_flip_axis,
+                nan_strategy=data_config.nan_strategy if data_config.nan_strategy != "drop_record" else "none",
+                nan_fill_value=data_config.nan_fill_value,
+                cache_mode=data_config.cache_mode,
+                cache_dir=data_config.cache_dir,
             )
 
-        del model, optimizer, scheduler, criterion, dataloaders, datasets
-        release_gpu_memory()
-        if prune_message is not None:
-            _raise_trial_pruned(prune_message)
+            from Preprocessing.dataset import AlanKidneyDataset
+            datasets = {
+                "train": AlanKidneyDataset(records=fold_train, transform=train_transform, **common_kwargs),
+                "val": AlanKidneyDataset(records=fold_val, transform=None, **common_kwargs),
+            }
+            generator = torch.Generator().manual_seed(fold_train_config.seed + fold_idx)
+            pin_memory = effective_pin_memory(fold_train_config.pin_memory, device)
+
+            fold_sampler = None
+            fold_shuffle = True
+            if getattr(fold_train_config, "use_weighted_sampler", False):
+                fold_sampler = _build_weighted_sampler(
+                    [int(r.label) for r in fold_train],
+                    seed=fold_train_config.seed + fold_idx,
+                )
+                fold_shuffle = False
+
+            fold_persistent = fold_train_config.num_workers > 0
+            dataloaders = {
+                "train": DataLoader(
+                    datasets["train"], batch_size=fold_train_config.batch_size,
+                    shuffle=fold_shuffle, sampler=fold_sampler,
+                    num_workers=fold_train_config.num_workers, pin_memory=pin_memory,
+                    persistent_workers=fold_persistent,
+                    prefetch_factor=2 if fold_persistent else None,
+                    generator=generator if fold_sampler is None else None,
+                ),
+                "val": DataLoader(datasets["val"], batch_size=fold_train_config.batch_size, shuffle=False,
+                                  num_workers=fold_train_config.num_workers, pin_memory=pin_memory,
+                                  persistent_workers=fold_persistent,
+                                  prefetch_factor=2 if fold_persistent else None),
+            }
+
+            tabular_feature_stats = (
+                compute_tabular_feature_stats(fold_train) if model_config.use_tabular_features else None
+            )
+            model = build_model(
+                model_config=model_config,
+                num_tabular_features=len(TABULAR_FEATURE_NAMES) if model_config.use_tabular_features else 0,
+            ).to(device)
+
+            pos_weight = compute_pos_weight(fold_train, fold_train_config.pos_weight_strategy)
+            criterion = build_criterion(fold_train_config, pos_weight, device)
+            optimizer = build_optimizer(model, fold_train_config)
+            scheduler = build_scheduler(optimizer, fold_train_config)
+
+            best_score = float("-inf")
+            best_epoch = -1
+            best_val_metrics: dict[str, float] = {}
+            best_checkpoint = fold_dir / "best_model.pt"
+            patience_counter = 0
+
+            for epoch in range(1, fold_train_config.epochs + 1):
+                train_metrics = run_epoch(model=model, dataloader=dataloaders["train"], criterion=criterion,
+                                          optimizer=optimizer, device=device, amp_enabled=fold_train_config.amp,
+                                          decision_threshold=fold_train_config.decision_threshold,
+                                          tabular_feature_stats=tabular_feature_stats,
+                                          gradient_clip_norm=fold_train_config.gradient_clip_norm)
+                val_y_true, val_y_prob, val_loss = _run_epoch_raw(
+                    model=model, dataloader=dataloaders["val"], criterion=criterion,
+                    optimizer=None, device=device, amp_enabled=False,
+                    tabular_feature_stats=tabular_feature_stats,
+                )
+                # Honor the configured threshold method so CV scoring matches what
+                # run_training would deploy (e.g. fbeta when HPO optimizes F1).
+                fold_threshold_method = getattr(fold_train_config, "threshold_selection", "youden")
+                fold_threshold_beta = float(getattr(fold_train_config, "threshold_fbeta", 1.0))
+                fold_min_spec = getattr(fold_train_config, "threshold_min_specificity", None)
+                fold_min_prec = getattr(fold_train_config, "threshold_min_precision", None)
+                fold_constrained_f1_min_spec = getattr(
+                    fold_train_config, "constrained_f1_min_specificity", None,
+                )
+                if fold_threshold_method == "fixed":
+                    val_threshold = float(fold_train_config.decision_threshold)
+                else:
+                    val_threshold = optimize_threshold(
+                        val_y_true, val_y_prob,
+                        method=fold_threshold_method, beta=fold_threshold_beta,
+                        min_specificity=fold_min_spec, min_precision=fold_min_prec,
+                    )
+                val_metrics = compute_binary_classification_metrics(
+                    y_true=val_y_true, y_prob=val_y_prob, threshold=val_threshold,
+                    constrained_f1_min_specificity=fold_constrained_f1_min_spec,
+                )
+                val_metrics["loss"] = val_loss
+                score = select_model_score(val_metrics, primary_metric=fold_train_config.primary_metric)
+
+                if scheduler is not None:
+                    scheduler.step()
+
+                if score > best_score + fold_train_config.early_stopping_min_delta:
+                    best_score = score
+                    best_epoch = epoch
+                    best_val_metrics = val_metrics
+                    patience_counter = 0
+                    torch.save({"model_state_dict": model.state_dict()}, best_checkpoint)
+                elif epoch > fold_train_config.warmup_epochs:
+                    patience_counter += 1
+
+                if patience_counter >= fold_train_config.early_stopping_patience:
+                    break
+
+            fold_result = {
+                "fold": fold_idx + 1,
+                "best_epoch": best_epoch,
+                "best_score": best_score,
+                "best_val_metrics": best_val_metrics,
+            }
+            fold_results.append(fold_result)
+            save_json(fold_result, fold_dir / "fold_result.json")
+
+            prune_message = None
+            if trial is not None:
+                primary = train_config.primary_metric
+                running_scores = [
+                    fr["best_val_metrics"].get(primary)
+                    for fr in fold_results
+                ]
+                running_scores = [
+                    float(score) for score in running_scores
+                    if score is not None and not (isinstance(score, float) and math.isnan(score))
+                ]
+                if running_scores:
+                    running_mean = float(np.mean(running_scores))
+                    running_std = float(np.std(running_scores)) if len(running_scores) > 1 else 0.0
+                    penalty = float(getattr(train_config, "cv_score_std_penalty", 0.0) or 0.0)
+                    trial.report(running_mean - penalty * running_std, step=fold_idx + 1)
+                    if trial.should_prune():
+                        prune_message = (
+                            f"Pruned after fold {fold_idx + 1} with running_mean={running_mean:.4f}."
+                        )
+
+            if not quiet:
+                roc = best_val_metrics.get("roc_auc")
+                roc_str = f"{roc:.4f}" if roc is not None and not math.isnan(roc) else "N/A"
+                primary_value = best_val_metrics.get(fold_train_config.primary_metric)
+                primary_str = (
+                    f"{primary_value:.4f}"
+                    if primary_value is not None and not math.isnan(primary_value)
+                    else "N/A"
+                )
+                print(
+                    f"  Fold {fold_idx + 1} | Best epoch: {best_epoch} | "
+                    f"Val ROC-AUC: {roc_str} | Val {fold_train_config.primary_metric}: {primary_str}"
+                )
+
+            if prune_message is not None:
+                _raise_trial_pruned(prune_message)
+        finally:
+            model = optimizer = scheduler = criterion = dataloaders = datasets = None
+            release_gpu_memory()
 
     # Aggregate fold validation metrics
     metric_keys = [k for k in fold_results[0]["best_val_metrics"] if isinstance(fold_results[0]["best_val_metrics"][k], (int, float))]
